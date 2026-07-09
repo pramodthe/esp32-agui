@@ -1,6 +1,6 @@
 // AG-UI on-device voice client — application entry point.
 // P0/P0.5: WiFi (multi-SSID + captive portal). P1: streaming STT (Soniox). P2: AG-UI client.
-// P3: chat UI on the AMOLED + BOOT-button push-to-talk. See docs/agui-voice-plan.md.
+// P3: chat UI on the AMOLED + BOOT-button push-to-talk. See docs/esp32-agui-plan.md.
 //
 // Turn model (P3 PTT): no continuous STT session. Hold the BOOT button → open the Soniox session
 // and stream the mic (live transcript in the status line); release → stop the session and send the
@@ -36,7 +36,7 @@
 #include "esp_codec_dev.h"
 #include "bsp/esp32_s3_touch_amoled_1_8.h"
 
-static const char *TAG = "agui_voice";
+static const char *TAG = "esp32_agui";
 
 #define PTT_GPIO    0                 // BOOT button: strapping pin at RESET only; normal input at runtime
 #define IDLE_HINT   "Hold Top Button to talk"

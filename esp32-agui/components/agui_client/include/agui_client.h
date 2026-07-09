@@ -3,7 +3,7 @@
 // POST RunAgentInput → consume SSE event stream. Ported from the ag-ui C++ SDK
 // (libcurl→esp_http_client, nlohmann→cJSON). Three device extensions: per-run ambient
 // `context`, Interrupt→resume, client-tool dispatch. v1 skips STATE_*/JSON-Patch.
-// See docs/agui-voice-plan.md §5.2 / §6.
+// See docs/esp32-agui-plan.md §5.2 / §6.
 #pragma once
 
 #include <stdbool.h>

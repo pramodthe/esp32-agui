@@ -79,21 +79,21 @@ The on-device AG-UI client **vendors and extends the community C++ AG-UI SDK**
 `esp_http_client` (streaming SSE), nlohmann/json → cJSON, plus device extensions (per-run ambient
 `context`, `REASONING_*` events, interrupt → resume, client-tool dispatch). `agui_client` is a thin
 `extern "C"` shim over the SDK's `HttpAgent` + an `IAgentSubscriber`. Local deltas to the vendored
-SDK are tracked in [agui_sdk/PATCHES.md](agui-voice/components/agui_sdk/PATCHES.md).
+SDK are tracked in [agui_sdk/PATCHES.md](esp32-agui/components/agui_sdk/PATCHES.md).
 
 ---
 
 ## Repository layout
 
 ```
-esp32-agui/
-├── agui-voice/                  ← the ESP-IDF project (self-contained; build this)
+esp32-agui/                      ← repo root
+├── esp32-agui/                  ← the ESP-IDF project (self-contained; build this)
 │   ├── main/                    ← app entry + push-to-talk turn state machine
 │   ├── components/              ← first-party components (below) + vendored board BSP/drivers
 │   ├── sdkconfig.defaults       ← target esp32s3, TLS 1.3, PSRAM, power mgmt, LVGL config
 │   └── partitions.csv           ← nvs · 3 MB app · 256 KB "alarmimg" (uploaded alarm graphic)
 ├── docs/
-│   ├── agui-voice-plan.md       ← full design: components, APIs, state machine, build phases
+│   ├── esp32-agui-plan.md       ← full design: components, APIs, state machine, build phases
 │   ├── flashing.md              ← flash workflow + NVS-wipe recovery
 │   └── soniox-rt-protocol.md    ← verified Soniox real-time WSS protocol notes (STT + TTS)
 ├── .claude/commands/            ← /idf-build /idf-flash /idf-monitor /idf-qemu /idf-size /idf-docs
@@ -101,20 +101,20 @@ esp32-agui/
 └── README.md                    ← you are here
 ```
 
-### First-party firmware components ([agui-voice/components/](agui-voice/components/))
+### First-party firmware components ([esp32-agui/components/](esp32-agui/components/))
 
 | Component | Responsibility |
 |---|---|
-| [`agui_client`](agui-voice/components/agui_client/) | Thin `extern "C"` shim over the vendored AG-UI SDK: POST `RunAgentInput` → handler callbacks |
-| [`agui_sdk`](agui-voice/components/agui_sdk/) | Vendored + ESP-ported community C++ AG-UI SDK (streaming SSE parser, event router) |
-| [`soniox_client`](agui-voice/components/soniox_client/) | ES8311 mic capture → Soniox WSS streaming STT → partial/final transcript callbacks |
-| [`soniox_tts_client`](agui-voice/components/soniox_tts_client/) | Reply text → Soniox WSS streaming TTS → PCM → ES8311 speaker (cancelable for barge-in) |
-| [`chat_ui`](agui-voice/components/chat_ui/) | LVGL chat bubbles, status line, touch-to-talk, configurable screen power saver, ringing-alarm overlay (uploaded graphic), idle screensaver |
-| [`net_prov`](agui-voice/components/net_prov/) | Multi-SSID WiFi connect + auto-reconnect + SoftAP captive-portal provisioning (keys/TZ/voice/timeout + alarm-image upload) |
-| [`alarm_img`](agui-voice/components/alarm_img/) | Store/load the user-uploaded alarm graphic (240×240 RGB565) in a dedicated flash partition, staged via PSRAM |
-| [`app_cfg`](agui-voice/components/app_cfg/) | Tiny NVS-backed config/secret store (Soniox key, AG-UI URL + bearer, TZ, voice, volume, screen timeout, idle-anim flag) |
-| [`device_tools`](agui-voice/components/device_tools/) | Ambient context (battery/time/voice) + client-tool registry (`set_timer`) |
-| [`esp32_s3_touch_amoled_1_8`](agui-voice/components/esp32_s3_touch_amoled_1_8/) | Board BSP (display/touch/audio bring-up); vendored from the Waveshare LVGL example |
+| [`agui_client`](esp32-agui/components/agui_client/) | Thin `extern "C"` shim over the vendored AG-UI SDK: POST `RunAgentInput` → handler callbacks |
+| [`agui_sdk`](esp32-agui/components/agui_sdk/) | Vendored + ESP-ported community C++ AG-UI SDK (streaming SSE parser, event router) |
+| [`soniox_client`](esp32-agui/components/soniox_client/) | ES8311 mic capture → Soniox WSS streaming STT → partial/final transcript callbacks |
+| [`soniox_tts_client`](esp32-agui/components/soniox_tts_client/) | Reply text → Soniox WSS streaming TTS → PCM → ES8311 speaker (cancelable for barge-in) |
+| [`chat_ui`](esp32-agui/components/chat_ui/) | LVGL chat bubbles, status line, touch-to-talk, configurable screen power saver, ringing-alarm overlay (uploaded graphic), idle screensaver |
+| [`net_prov`](esp32-agui/components/net_prov/) | Multi-SSID WiFi connect + auto-reconnect + SoftAP captive-portal provisioning (keys/TZ/voice/timeout + alarm-image upload) |
+| [`alarm_img`](esp32-agui/components/alarm_img/) | Store/load the user-uploaded alarm graphic (240×240 RGB565) in a dedicated flash partition, staged via PSRAM |
+| [`app_cfg`](esp32-agui/components/app_cfg/) | Tiny NVS-backed config/secret store (Soniox key, AG-UI URL + bearer, TZ, voice, volume, screen timeout, idle-anim flag) |
+| [`device_tools`](esp32-agui/components/device_tools/) | Ambient context (battery/time/voice) + client-tool registry (`set_timer`) |
+| [`esp32_s3_touch_amoled_1_8`](esp32-agui/components/esp32_s3_touch_amoled_1_8/) | Board BSP (display/touch/audio bring-up); vendored from the Waveshare LVGL example |
 | `board_variant`, `esp_lcd_*`, `espressif__*` | Vendored display/touch drivers + ESP component-registry deps |
 
 ---
@@ -149,7 +149,7 @@ Target chip is always **esp32s3** — it comes from `sdkconfig.defaults`, so **d
 All commands run from inside the project dir.
 
 ```bash
-cd agui-voice
+cd esp32-agui
 idf.py build
 ```
 
@@ -165,7 +165,7 @@ idf.py -p <PORT> flash monitor
 port doesn't enumerate, hold **BOOT**, tap **RESET**, then release **BOOT** to force ROM
 download mode.
 
-> ⚠️ **Routine reflash = app alone at `0x10000`** (`build/agui_voice.bin`) — it leaves NVS intact.
+> ⚠️ **Routine reflash = app alone at `0x10000`** (`build/esp32_agui.bin`) — it leaves NVS intact.
 > Flashing a *merged* image at `0x0` pads the NVS region (`0x9000`) with `0xFF` and **wipes your
 > saved WiFi/keys**. When the **partition table changes** (e.g. the `alarmimg` partition was added),
 > flash it once too: a normal `idf.py flash` writes bootloader + partition-table (`0x8000`) + app and
@@ -257,7 +257,7 @@ Backlog (post-P8): A2UI generative-UI rendering, wake-word turn control, `device
 shared state.
 
 The full design — component APIs, runtime state machine, AG-UI event→UI mapping, and per-phase
-acceptance criteria — is in [docs/agui-voice-plan.md](docs/agui-voice-plan.md).
+acceptance criteria — is in [docs/esp32-agui-plan.md](docs/esp32-agui-plan.md).
 
 ---
 
@@ -269,12 +269,12 @@ It builds on, ports, or interoperates with:
 
 - **AG-UI protocol** ([ag-ui-protocol/ag-ui](https://github.com/ag-ui-protocol/ag-ui)) — the
   on-device client vendors and ESP-ports the community **C++ SDK** (`sdks/community/c++`); local
-  deltas are documented in [agui_sdk/PATCHES.md](agui-voice/components/agui_sdk/PATCHES.md).
+  deltas are documented in [agui_sdk/PATCHES.md](esp32-agui/components/agui_sdk/PATCHES.md).
 - **Soniox** real-time **STT** (model `stt-rt-v5`) and **TTS** (model `tts-rt-v1`) over WSS —
   protocol notes in [docs/soniox-rt-protocol.md](docs/soniox-rt-protocol.md).
 - **Waveshare ESP32-S3-Touch-AMOLED-1.8 BSP + drivers**
   ([waveshareteam/ESP32-S3-Touch-AMOLED-1.8](https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.8))
-  — vendored under `agui-voice/components/`.
+  — vendored under `esp32-agui/components/`.
 - **Espressif ESP-IDF**, **LVGL 8.4**, and ESP component-registry packages
   (`esp_lcd_sh8601`/`esp_lcd_co5300`, `esp_lcd_touch_*`, `button`, `esp_codec_dev`,
   `esp_websocket_client`, …).

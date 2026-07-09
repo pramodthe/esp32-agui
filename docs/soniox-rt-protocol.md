@@ -1,7 +1,7 @@
 # Soniox real-time STT — verified protocol (for `soniox_client`)
 
 Verified 2026-06-21 against live Soniox docs + the official `soniox_realtime.py` example
-(multi-source, adversarially checked; confidence: high). Drives [agui-voice/components/soniox_client](../agui-voice/components/soniox_client/).
+(multi-source, adversarially checked; confidence: high). Drives [esp32-agui/components/soniox_client](../esp32-agui/components/soniox_client/).
 
 ## Endpoint & auth
 - **WSS:** `wss://stt-rt.soniox.com/transcribe-websocket` (TLS; no query/subprotocol).

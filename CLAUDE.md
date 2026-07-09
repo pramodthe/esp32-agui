@@ -2,8 +2,8 @@
 
 This repo (**`contextablemark/esp32-agui`**) is the custom **on-device AG-UI voice client**
 firmware for the **Waveshare ESP32-S3-Touch-AMOLED-1.8** board. The ESP-IDF project lives in
-[agui-voice/](agui-voice/) and is **self-contained** (it vendors the board BSP + drivers under
-`agui-voice/components/`).
+[esp32-agui/](esp32-agui/) and is **self-contained** (it vendors the board BSP + drivers under
+`esp32-agui/components/`).
 
 > The board's stock `examples/` and factory `Firmware/` `.bin` images referenced below are **not
 > in this repo** — they live in the upstream Waveshare repo
@@ -104,7 +104,7 @@ agent activity on the AMOLED via **LVGL**. Putting the AG-UI client on-device is
 `TOOL_CALL_*`/interrupt events drive the screen, and the device exposes its sensors/screen/touch
 as agent-callable tools + ambient context.
 
-→ **Full plan (components, APIs, state machine, build phases): [docs/agui-voice-plan.md](docs/agui-voice-plan.md).**
+→ **Full plan (components, APIs, state machine, build phases): [docs/esp32-agui-plan.md](docs/esp32-agui-plan.md).**
 
 **Base:** ESP-IDF 5.5.x on this repo's BSP (`esp32_s3_touch_amoled_1_8`, from
 `examples/ESP-IDF-v5.5.1/05_LVGL_WITH_RAM` + `06_I2SCodec`) — SH8601 + FT3168 + ES8311 + LVGL 8.4

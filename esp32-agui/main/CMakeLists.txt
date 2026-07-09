@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "agui_voice_main.c"
+    SRCS "esp32_agui_main.c"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash

@@ -3,7 +3,7 @@
 // Primary: multi-SSID list stored in NVS, tried with early-abort (pattern adapted from
 // app-pixels/ai-chat wifi_try_connect(), ported to esp_wifi/esp_netif).
 // Fallback (P0.5): SoftAP "AMOLED-setup" captive portal to enter creds from a phone.
-// See docs/agui-voice-plan.md §5.5.
+// See docs/esp32-agui-plan.md §5.5.
 #pragma once
 
 #include <stdbool.h>

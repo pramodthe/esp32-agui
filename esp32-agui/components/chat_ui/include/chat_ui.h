@@ -3,7 +3,7 @@
 // Renders TEXT_* as chat bubbles, REASONING_*/TOOL_CALL_*/RUN_* as ephemeral status,
 // and response_schema-driven interrupt prompts (touch). UI cues borrowed from
 // app-pixels/ai-assistant-claude (status pill, VU meter, "You:/AI:" labels). Font
-// management: LVGL fonts in flash + fallback glyph. See docs/agui-voice-plan.md §5.4 / §9.
+// management: LVGL fonts in flash + fallback glyph. See docs/esp32-agui-plan.md §5.4 / §9.
 #pragma once
 
 #include <stdint.h>

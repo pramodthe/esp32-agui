@@ -2,7 +2,7 @@
 //
 // Ambient context per run = motion (QMI8658) + battery (AXP2101) + local_time (PCF85063).
 // Builtin client tools: set_timer, set_alarm, show_qr. Dispatched from AG-UI TOOL_CALL_*.
-// See docs/agui-voice-plan.md §5.3 / §6.
+// See docs/esp32-agui-plan.md §5.3 / §6.
 #pragma once
 
 #include <stdbool.h>
