@@ -757,19 +757,28 @@ void app_main(void)
     { char v[4]; chat_ui_set_idle_anim_enabled(app_cfg_get(APP_CFG_IDLE_ANIM, v, sizeof v) && v[0] == '1'); }  // idle screensaver
     ESP_LOGI(TAG, "ready — long-press the screen or hold BOOT to talk");
 
-    // Heartbeat: link + heap (internal RAM is the scarce one with the display).
+    // Heartbeat: link + heap (internal RAM is the scarce one with the display) + UI liveness.
     char ip[16];
+    uint32_t ui_last = chat_ui_ui_ticks();
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(15000));
+        // UI liveness: the 1 Hz LVGL-task beacon must have moved between heartbeats. A stall means
+        // the LVGL task is wedged holding the display mutex (historically: a brightness tx_param
+        // racing a flush ate the trans-done) — everything else keeps running, so say it loudly.
+        uint32_t ui_now = chat_ui_ui_ticks();
+        bool ui_ok = (ui_now != ui_last);
+        ui_last = ui_now;
+        if (!ui_ok) ESP_LOGE(TAG, "UI STALLED: LVGL task hasn't run for a full heartbeat interval");
         if (net_get_ip_str(ip, sizeof ip)) {
             if (!net_time_synced()) net_time_http_fallback();   // P5: set clock via HTTPS if NTP is blocked
             // internal_max = largest contiguous internal block — TLS/lwIP send buffers need
             // contiguous internal RAM, so this matters more than total free when sessions fail.
-            ESP_LOGI(TAG, "heartbeat: online ip=%s listening=%d free=%u internal=%u internal_max=%u psram=%u",
+            ESP_LOGI(TAG, "heartbeat: online ip=%s listening=%d free=%u internal=%u internal_max=%u psram=%u ui=%s",
                      ip, s_listening, (unsigned)esp_get_free_heap_size(),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                     ui_ok ? "ok" : "STALLED");
         } else {
             ESP_LOGW(TAG, "heartbeat: offline");
         }

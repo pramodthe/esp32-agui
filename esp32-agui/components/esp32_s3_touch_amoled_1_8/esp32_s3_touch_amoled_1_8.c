@@ -461,7 +461,31 @@ esp_err_t bsp_display_brightness_set(int brightness_percent)
     lcd_cmd <<= 8;
     lcd_cmd |= 0x02 << 24;
     uint8_t param = brightness;
+
+    // esp_lcd panel IO is not thread-safe, and this QSPI io handle is shared with LVGL's color
+    // flushes: a polling tx_param racing an in-flight queued tx_color can swallow the flush's
+    // trans-done completion, leaving the LVGL task waiting on it forever while holding the display
+    // mutex — a silent, permanent UI wedge (every later locker just logs "Failed to acquire LVGL
+    // lock"; heartbeats keep running). Serialize: hold the (recursive) display lock so the LVGL
+    // task can't start a new flush, then drain any in-flight band DMA — the default flush path is
+    // asynchronous, so the lock alone doesn't cover a tail transfer. Before the adapter exists the
+    // lock fails cleanly (ESP_ERR_INVALID_STATE) and nothing else is flushing, so send unlocked.
+    // Do not call from the LVGL task while a flush it issued is pending.
+    bool locked = bsp_display_lock(1000);
+    if (locked) {
+#if LVGL_VERSION_MAJOR < 9
+        lv_disp_t *disp = lv_disp_get_default();
+        if (disp && disp->driver && disp->driver->draw_buf) {
+            for (int i = 0; disp->driver->draw_buf->flushing && i < 100; ++i) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+        }
+#endif
+    }
     esp_lcd_panel_io_tx_param(io_handle, lcd_cmd, &param, 1);
+    if (locked) {
+        bsp_display_unlock();
+    }
 
     return ESP_OK;
 }

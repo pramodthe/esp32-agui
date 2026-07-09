@@ -56,6 +56,9 @@ void     chat_ui_alarm_flash(bool on);
 // ms since the last touch (LVGL input inactivity — object-independent, so a tap anywhere counts),
 // or UINT32_MAX if the LVGL lock is momentarily busy. Used to detect a tap-to-dismiss during an alarm.
 uint32_t chat_ui_touch_idle_ms(void);
+// UI liveness counter, bumped once a second from inside the LVGL task. If successive reads are
+// equal, the LVGL task is wedged (holding the display mutex) — surface it in the heartbeat.
+uint32_t chat_ui_ui_ticks(void);
 
 // Power-state hook: called from the screen-power task whenever the display turns on/off. Lets the app
 // gate power management on display state (e.g. allow light sleep only while the display is off).

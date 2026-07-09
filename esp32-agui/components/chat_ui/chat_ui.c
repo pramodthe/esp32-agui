@@ -140,6 +140,14 @@ static void chat_ui_activity_evt_cb(lv_event_t *e)
 
 static void chat_ui_talk_evt_cb(lv_event_t *e);   // touch-to-talk; defined with the screen-power code below
 
+// --- UI liveness: a 1 Hz lv_timer bumps a counter from inside the LVGL task. If the counter stops
+// moving, the LVGL task is wedged (e.g. waiting forever on a lost flush completion) — everything
+// else keeps running, so without this the only symptom is later "Failed to acquire LVGL lock"
+// timeouts. The app heartbeat compares successive reads and flags "ui=STALLED".
+static volatile uint32_t s_ui_ticks;
+static void ui_tick_cb(lv_timer_t *t) { (void)t; s_ui_ticks++; }
+uint32_t chat_ui_ui_ticks(void) { return s_ui_ticks; }
+
 esp_err_t chat_ui_init(void)
 {
     if (!bsp_display_start()) { ESP_LOGE(TAG, "bsp_display_start failed"); return ESP_FAIL; }
@@ -200,6 +208,8 @@ esp_err_t chat_ui_init(void)
     // (> this many px) still scrolls. Default is 10; 30 reliably distinguishes hold-to-talk from scroll.
     lv_indev_t *indev = lv_indev_get_next(NULL);
     if (indev && indev->driver) indev->driver->scroll_limit = 30;
+
+    lv_timer_create(ui_tick_cb, 1000, NULL);   // UI liveness beacon (see chat_ui_ui_ticks)
 
     bsp_display_unlock();
     bsp_display_brightness_set(SCREEN_ON_BRIGHTNESS);
