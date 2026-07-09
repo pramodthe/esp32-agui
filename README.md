@@ -165,6 +165,10 @@ idf.py -p <PORT> flash monitor
 port doesn't enumerate, hold **BOOT**, tap **RESET**, then release **BOOT** to force ROM
 download mode.
 
+Working **inside the devcontainer** (no USB there)? Flash and monitor over a serial-over-TCP
+bridge instead — `esp_rfc2217_server` on the host + `tools/monitor-bridge.sh`; procedure and
+gotchas in [docs/flashing.md](docs/flashing.md#flashing-from-inside-the-devcontainer-rfc2217-bridge).
+
 > ⚠️ **Routine reflash = app alone at `0x10000`** (`build/esp32_agui.bin`) — it leaves NVS intact.
 > Flashing a *merged* image at `0x0` pads the NVS region (`0x9000`) with `0xFF` and **wipes your
 > saved WiFi/keys**. When the **partition table changes** (e.g. the `alarmimg` partition was added),

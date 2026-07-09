@@ -71,6 +71,10 @@ Run from inside an example dir, e.g. `examples/ESP-IDF-v5.5.1/05_LVGL_WITH_RAM`
 - **Flash + monitor (real HW):** `idf.py -p <PORT> flash monitor` — `<PORT>` e.g.
   `/dev/ttyACM0` (Linux), `/dev/cu.usbmodem*` (macOS), or `COMx` (Windows), over the
   board's USB-C (native USB Serial/JTAG).
+- **Flash + monitor from the devcontainer:** the container has no USB — use the RFC2217
+  bridge (`esp_rfc2217_server` on the host + esptool `--before no_reset`, board manually in
+  download mode; monitor via `tools/monitor-bridge.sh`). Procedure + gotchas:
+  [docs/flashing.md](docs/flashing.md#flashing-from-inside-the-devcontainer-rfc2217-bridge).
 - **QEMU:** `idf.py qemu` — **CPU/RAM/UART only.** The AMOLED, touch, I²C sensors, SD,
   and codec are **not emulated**, so it's for boot/app-logic/networking, not the UI.
 - **Config / clean:** `idf.py menuconfig` · `idf.py fullclean`.
