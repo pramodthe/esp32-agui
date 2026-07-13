@@ -76,7 +76,7 @@ static const char *const DEEPGRAM_VOICES[] = {
     "aura-2-angus-en", "aura-2-orpheus-en", "aura-2-helios-en", "aura-2-zeus-en",
 };
 #define SONIOX_VOICE_DEFAULT   "Adrian"
-#define DEEPGRAM_VOICE_DEFAULT "aura-2-asteria-en"
+#define DEEPGRAM_VOICE_DEFAULT "aura-2-orion-en"   // male; Asteria/Luna/etc. female
 
 static const char FORM_TAIL_INTRO[] =
     "<p style='color:#666;font-size:.85em'>Timezone is auto-detected from your phone; change it if "
