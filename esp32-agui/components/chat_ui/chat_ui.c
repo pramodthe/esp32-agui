@@ -244,7 +244,7 @@ esp_err_t chat_ui_init(void)
     lv_obj_set_scrollbar_mode(s_chat, LV_SCROLLBAR_MODE_OFF);
 
     face_engine_create(scr);                           // Eyes page (spring-physics face)
-    companion_pages_create(scr);                       // Clock overlay
+    companion_pages_create(scr);                       // Eyes/Chat page shell
     lv_obj_move_foreground(s_status_box);
 
     // Touch/scroll = activity for the screen-power saver. This event cb runs INSIDE the LVGL task
