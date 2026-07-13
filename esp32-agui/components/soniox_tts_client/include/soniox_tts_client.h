@@ -16,10 +16,16 @@ extern "C" {
 
 // PCM sink: raw 16-bit/16k/mono samples to play. Provided by main (which owns the ES8311 OUT / s_spk),
 // so there is a single speaker owner (the beep + low-power codec-close never race a second handle).
+#ifndef TTS_PCM_SINK_T_DEFINED
+#define TTS_PCM_SINK_T_DEFINED
 typedef void (*tts_pcm_sink_t)(const void *pcm, size_t bytes);
+#endif
 
 // One-time: register the playback sink + spin up the drain task. Call once at boot.
 esp_err_t soniox_tts_init(tts_pcm_sink_t sink);
+
+// Tear down drain task + ring so another TTS backend can own the speaker sink.
+void soniox_tts_deinit(void);
 
 // Speak `text` and BLOCK until playback finishes (or error/timeout). Opens the TTS WSS, sends the
 // text, plays the returned PCM, closes. Soniox key comes from NVS (app_cfg). Serialized internally.

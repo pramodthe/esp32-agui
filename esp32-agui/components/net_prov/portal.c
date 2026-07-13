@@ -3,8 +3,11 @@
 
 #include "net_prov.h"
 #include "app_cfg.h"
+#include "speech_cfg.h"
 
+#include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include "freertos/FreeRTOS.h"
@@ -41,10 +44,15 @@ static const char FORM_HEAD[] =
     "input,select{display:block;width:100%;padding:.6em;margin:.4em 0;font-size:1em}"
     "button{padding:.7em 1.2em;font-size:1em}</style></head><body>"
     "<h2>AG-UI device setup</h2>"
-    "<form method=POST action=/save>"
+    "<form method=POST action=/save id=setup>"
     "<label>WiFi network (SSID)</label><input name=ssid autofocus>"
     "<label>WiFi password</label><input name=pass type=password>"
-    "<label>Soniox API key</label><input name=soniox>"
+    "<label>Speech provider</label>"
+    "<select name=speech_prov id=speech_prov>"
+    "<option value=soniox>Soniox</option>"
+    "<option value=deepgram>Deepgram</option>"
+    "</select>"
+    "<label>Speech API key</label><input name=speech_key autocomplete=off>"
     "<label>AG-UI endpoint URL</label><input name=agui_url>"
     "<label>AG-UI bearer token (optional)</label><input name=agui_token>"
     "<label>Timezone</label><select name=tz>";
@@ -53,29 +61,31 @@ static const char FORM_HEAD[] =
 // between this and FORM_TAIL by root_get(), with the saved voice marked selected.
 static const char FORM_MID[] =
     "</select>"
-    "<label>TTS voice</label><select name=voice>";
+    "<label>TTS voice</label><select name=voice id=voice>";
 
-// Soniox tts-rt-v1 voices (https://soniox.com/docs/tts/concepts/voices). Adrian first = the default.
-static const char *const TTS_VOICES[] = {
+// Soniox tts-rt-v1 voices (https://soniox.com/docs/tts/concepts/voices).
+static const char *const SONIOX_VOICES[] = {
     "Adrian", "Maya", "Daniel", "Noah", "Nina", "Emma", "Jack", "Claire", "Grace", "Owen",
     "Mina", "Kenji", "Rafael", "Mateo", "Lucia", "Sofia", "Oliver", "Arthur", "Isla", "Victoria",
     "Cooper", "Mason", "Ruby", "Elise", "Arjun", "Rohan", "Priya", "Meera",
 };
-#define TTS_VOICE_DEFAULT "Adrian"
+// Curated Deepgram Aura-2 voices (model id == voice).
+static const char *const DEEPGRAM_VOICES[] = {
+    "aura-2-asteria-en", "aura-2-luna-en", "aura-2-stella-en", "aura-2-athena-en",
+    "aura-2-hera-en", "aura-2-orion-en", "aura-2-arcas-en", "aura-2-perseus-en",
+    "aura-2-angus-en", "aura-2-orpheus-en", "aura-2-helios-en", "aura-2-zeus-en",
+};
+#define SONIOX_VOICE_DEFAULT   "Adrian"
+#define DEEPGRAM_VOICE_DEFAULT "aura-2-asteria-en"
 
-static const char FORM_TAIL[] =
-    // NB: the voice <select> is closed by root_get's dynamic chunk (which also emits the screen-timeout
-    // field pre-filled with the saved value), so FORM_TAIL no longer opens with "</select>".
+static const char FORM_TAIL_INTRO[] =
     "<p style='color:#666;font-size:.85em'>Timezone is auto-detected from your phone; change it if "
-    "needed. Leave WiFi blank if already connected; fill the Soniox key to enable voice and the "
-    "AG-UI URL to enable the agent.</p>"
-    "<button type=submit>Save &amp; connect</button></form>"
-    "<script>try{var z=Intl.DateTimeFormat().resolvedOptions().timeZone,"
-    "s=document.querySelector('select[name=tz]');"
-    "for(var i=0;i<s.options.length;i++){if(s.options[i].text===z){s.selectedIndex=i;break;}}}"
-    "catch(e){}</script>"
-    // Alarm graphic: any image, cropped in-browser to 240x240 and converted to RGB565 (high byte
-    // first, matching the device's LV_COLOR_16_SWAP) so the device stores the raw bytes with no decode.
+    "needed. Leave WiFi blank if already connected. Soniox is the default; choose Deepgram to use "
+    "that provider instead. Paste that provider's API key (required when switching) and set the "
+    "AG-UI URL.</p>"
+    "<button type=submit>Save &amp; connect</button></form>";
+
+static const char FORM_TAIL_ALARM[] =
     "<hr><h3>Alarm image (optional)</h3>"
     "<p style='color:#666;font-size:.85em'>Shown when a timer goes off. Any image - it's cropped to "
     "a 240x240 square (preview below) and sent to the device.</p>"
@@ -157,22 +167,38 @@ static bool form_field(const char *body, const char *name, char *out, size_t out
 static esp_err_t root_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");   // always serve the current form (no stale cache)
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_send_chunk(req, FORM_HEAD, HTTPD_RESP_USE_STRLEN);
-    httpd_resp_send_chunk(req, TZ_OPTIONS, HTTPD_RESP_USE_STRLEN);   // ~24 KB timezone <option> list
-    httpd_resp_send_chunk(req, FORM_MID, HTTPD_RESP_USE_STRLEN);     // close tz <select>, open voice <select>
+    httpd_resp_send_chunk(req, TZ_OPTIONS, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, FORM_MID, HTTPD_RESP_USE_STRLEN);
 
-    // TTS-voice <option>s, pre-selecting the saved voice (so re-saving keeps it); default Adrian.
-    char saved[APP_CFG_VAL_MAX];
-    if (!app_cfg_get(APP_CFG_TTS_VOICE, saved, sizeof saved)) strlcpy(saved, TTS_VOICE_DEFAULT, sizeof saved);
-    char opts[1500];
+    speech_provider_t prov = speech_provider_get();
+    char saved_voice[APP_CFG_VAL_MAX];
+    if (!app_cfg_get(APP_CFG_TTS_VOICE, saved_voice, sizeof saved_voice))
+        strlcpy(saved_voice,
+                (prov == SPEECH_PROVIDER_SONIOX) ? SONIOX_VOICE_DEFAULT : DEEPGRAM_VOICE_DEFAULT,
+                sizeof saved_voice);
+
+    // Pre-select speech provider in the form (patch via tiny script after options).
+    char opts[3500];
     size_t o = 0;
-    for (size_t i = 0; i < sizeof(TTS_VOICES) / sizeof(TTS_VOICES[0]); i++)
-        o += snprintf(opts + o, sizeof(opts) - o, "<option%s>%s</option>",
-                      strcmp(TTS_VOICES[i], saved) == 0 ? " selected" : "", TTS_VOICES[i]);
+    // Emit both voice lists as JS arrays + initial options for current provider.
+    o += snprintf(opts + o, sizeof(opts) - o, "<script>window.__dg=[");
+    for (size_t i = 0; i < sizeof(DEEPGRAM_VOICES) / sizeof(DEEPGRAM_VOICES[0]); i++)
+        o += snprintf(opts + o, sizeof(opts) - o, "%s\"%s\"", i ? "," : "", DEEPGRAM_VOICES[i]);
+    o += snprintf(opts + o, sizeof(opts) - o, "];window.__sx=[");
+    for (size_t i = 0; i < sizeof(SONIOX_VOICES) / sizeof(SONIOX_VOICES[0]); i++)
+        o += snprintf(opts + o, sizeof(opts) - o, "%s\"%s\"", i ? "," : "", SONIOX_VOICES[i]);
+    o += snprintf(opts + o, sizeof(opts) - o, "];</script>");
 
-    // Close the voice <select>, then the screen-timeout field, pre-filled with the saved value (so
-    // re-saving keeps it). Default 60 s; 0 = always on.
+    const char *const *list = (prov == SPEECH_PROVIDER_SONIOX) ? SONIOX_VOICES : DEEPGRAM_VOICES;
+    size_t nlist = (prov == SPEECH_PROVIDER_SONIOX)
+                       ? sizeof(SONIOX_VOICES) / sizeof(SONIOX_VOICES[0])
+                       : sizeof(DEEPGRAM_VOICES) / sizeof(DEEPGRAM_VOICES[0]);
+    for (size_t i = 0; i < nlist; i++)
+        o += snprintf(opts + o, sizeof(opts) - o, "<option%s>%s</option>",
+                      strcmp(list[i], saved_voice) == 0 ? " selected" : "", list[i]);
+
     char scr_to[8];
     if (!app_cfg_get(APP_CFG_SCREEN_TO, scr_to, sizeof scr_to)) strlcpy(scr_to, "60", sizeof scr_to);
     o += snprintf(opts + o, sizeof(opts) - o,
@@ -180,8 +206,6 @@ static esp_err_t root_get(httpd_req_t *req)
                   "<label>Screen blank timeout (seconds, 0 = always on)</label>"
                   "<input name=scr_to type=number min=0 max=86400 value='%s'>", scr_to);
 
-    // Idle-animation checkbox, pre-checked from the saved state (so re-saving keeps it). Inline style
-    // overrides the form's block/full-width input rule.
     char ia[4];
     bool ia_on = app_cfg_get(APP_CFG_IDLE_ANIM, ia, sizeof ia) && ia[0] == '1';
     o += snprintf(opts + o, sizeof(opts) - o,
@@ -191,8 +215,29 @@ static esp_err_t root_get(httpd_req_t *req)
                   ia_on ? " checked" : "");
     httpd_resp_send_chunk(req, opts, o);
 
-    httpd_resp_send_chunk(req, FORM_TAIL, HTTPD_RESP_USE_STRLEN);
-    return httpd_resp_send_chunk(req, NULL, 0);              // terminate the chunked response
+    httpd_resp_send_chunk(req, FORM_TAIL_INTRO, HTTPD_RESP_USE_STRLEN);
+
+    // Provider select sync + timezone auto-detect.
+    char script[900];
+    snprintf(script, sizeof script,
+             "<script>(function(){"
+             "var prov=document.getElementById('speech_prov'),voice=document.getElementById('voice');"
+             "prov.value='%s';"
+             "function fill(list,defV){var cur=voice.value;voice.innerHTML='';"
+             "for(var i=0;i<list.length;i++){var o=document.createElement('option');"
+             "o.value=list[i];o.textContent=list[i];"
+             "if(list[i]===cur||(!cur&&list[i]===defV))o.selected=true;voice.appendChild(o);}}"
+             "prov.addEventListener('change',function(){"
+             "if(prov.value==='soniox')fill(window.__sx,'%s');else fill(window.__dg,'%s');});"
+             "try{var z=Intl.DateTimeFormat().resolvedOptions().timeZone,"
+             "s=document.querySelector('select[name=tz]');"
+             "for(var i=0;i<s.options.length;i++){if(s.options[i].text===z){s.selectedIndex=i;break;}}}"
+             "catch(e){}"
+             "})();</script>",
+             speech_provider_name(prov), SONIOX_VOICE_DEFAULT, DEEPGRAM_VOICE_DEFAULT);
+    httpd_resp_send_chunk(req, script, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, FORM_TAIL_ALARM, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 static esp_err_t save_post(httpd_req_t *req)
@@ -207,19 +252,22 @@ static esp_err_t save_post(httpd_req_t *req)
     }
     body[got] = '\0';
 
-    char ssid[33] = {0}, pass[65] = {0}, soniox[APP_CFG_VAL_MAX] = {0};
+    char ssid[33] = {0}, pass[65] = {0}, speech_key[APP_CFG_VAL_MAX] = {0};
     char agui_url[APP_CFG_VAL_MAX] = {0}, agui_token[APP_CFG_VAL_MAX] = {0}, tz[64] = {0};
-    char voice[APP_CFG_VAL_MAX] = {0}, scr_to[8] = {0};
+    char voice[APP_CFG_VAL_MAX] = {0}, scr_to[8] = {0}, speech_prov[24] = {0};
     bool have_ssid   = form_field(body, "ssid", ssid, sizeof(ssid)) && ssid[0];
-    bool have_soniox = form_field(body, "soniox", soniox, sizeof(soniox)) && soniox[0];
+    bool have_key    = form_field(body, "speech_key", speech_key, sizeof(speech_key)) && speech_key[0];
+    // Legacy field name from older portal builds.
+    if (!have_key) have_key = form_field(body, "soniox", speech_key, sizeof(speech_key)) && speech_key[0];
+    bool have_prov   = form_field(body, "speech_prov", speech_prov, sizeof(speech_prov)) && speech_prov[0];
     bool have_url    = form_field(body, "agui_url", agui_url, sizeof(agui_url)) && agui_url[0];
     bool have_token  = form_field(body, "agui_token", agui_token, sizeof(agui_token)) && agui_token[0];
     bool have_tz     = form_field(body, "tz", tz, sizeof(tz)) && tz[0];
     bool have_voice  = form_field(body, "voice", voice, sizeof(voice)) && voice[0];
     bool have_scr    = form_field(body, "scr_to", scr_to, sizeof(scr_to)) && scr_to[0];
-    ESP_LOGI(TAG, "save: body=%dB  ssid=%d soniox=%d url=%d token=%d tz=%d voice=%d scr=%d",
-             got, have_ssid, have_soniox, have_url, have_token, have_tz, have_voice, have_scr);
-    if (!have_ssid && !have_soniox && !have_url && !have_token && !have_tz && !have_voice && !have_scr) {
+    ESP_LOGI(TAG, "save: body=%dB ssid=%d key=%d prov=%d url=%d token=%d tz=%d voice=%d scr=%d",
+             got, have_ssid, have_key, have_prov, have_url, have_token, have_tz, have_voice, have_scr);
+    if (!have_ssid && !have_key && !have_prov && !have_url && !have_token && !have_tz && !have_voice && !have_scr) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "nothing to save");
         return ESP_FAIL;
     }
@@ -227,7 +275,38 @@ static esp_err_t save_post(httpd_req_t *req)
         form_field(body, "pass", pass, sizeof(pass));
         net_creds_add(ssid, pass);
     }
-    if (have_soniox) app_cfg_set(APP_CFG_SONIOX_KEY, soniox);
+
+    speech_provider_t old_prov = speech_provider_get();
+    speech_provider_t new_prov = old_prov;
+    if (have_prov) {
+        new_prov = (strcmp(speech_prov, SPEECH_PROVIDER_SONIOX_STR) == 0)
+                       ? SPEECH_PROVIDER_SONIOX : SPEECH_PROVIDER_DEEPGRAM;
+    }
+
+    // Switching provider requires a key for the new vendor (legacy soniox_key is Soniox-only).
+    if (have_prov && new_prov != old_prov && !have_key) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "API key required when switching speech provider");
+        return ESP_FAIL;
+    }
+
+    if (have_prov) {
+        app_cfg_set(APP_CFG_SPEECH_PROVIDER, speech_provider_name(new_prov));
+        // Reset voice to the new provider's default unless this POST also sets a voice.
+        if (!have_voice) {
+            app_cfg_set(APP_CFG_TTS_VOICE,
+                        (new_prov == SPEECH_PROVIDER_SONIOX) ? SONIOX_VOICE_DEFAULT
+                                                             : DEEPGRAM_VOICE_DEFAULT);
+        }
+    }
+    if (have_key) {
+        app_cfg_set(APP_CFG_SPEECH_KEY, speech_key);
+        // Keep legacy key in sync when Soniox is selected (older tools / migration).
+        if (new_prov == SPEECH_PROVIDER_SONIOX)
+            app_cfg_set(APP_CFG_SONIOX_KEY, speech_key);
+    }
+    if (have_prov || have_key) speech_cfg_invalidate();
+
     if (have_url)    app_cfg_set(APP_CFG_AGUI_URL, agui_url);
     if (have_token)  app_cfg_set(APP_CFG_AGUI_TOKEN, agui_token);
     if (have_tz)     app_cfg_set(APP_CFG_TZ, tz);
@@ -262,7 +341,8 @@ static esp_err_t save_post(httpd_req_t *req)
         "<body style='font-family:sans-serif;margin:2em'><h3>Saved</h3>"
         "<p>This is exactly what the device received:</p><ul>"
         "<li>WiFi: <b>%s</b></li>"
-        "<li>Soniox key: <b>%s</b></li>"
+        "<li>Speech provider: <b>%s</b></li>"
+        "<li>Speech API key: <b>%s</b></li>"
         "<li>AG-UI URL: <b>%s</b></li>"
         "<li>AG-UI token: <b>%s</b></li>"
         "<li>Timezone: <b>%s</b></li>"
@@ -272,7 +352,8 @@ static esp_err_t save_post(httpd_req_t *req)
         "</ul><p>If AG-UI URL says \"unchanged\" but you typed one, your phone submitted a cached "
         "form — reload <a href='http://192.168.4.1/'>192.168.4.1</a> and try again.</p></body></html>",
         have_ssid ? "updated" : "unchanged",
-        have_soniox ? "updated" : "unchanged",
+        have_prov ? speech_prov : "unchanged",
+        have_key ? "updated" : "unchanged",
         have_url ? agui_url : "unchanged",
         have_token ? "updated" : "unchanged",
         have_tz ? tz : "unchanged",

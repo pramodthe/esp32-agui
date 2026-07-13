@@ -32,6 +32,10 @@ typedef void (*soniox_turn_cb)(const char *final_text, void *ctx);
 // Bring up the microphone codec (16 kHz mono). Call once.
 esp_err_t soniox_client_init(void);
 
+// Release the mic codec handle so another STT backend can own I2S-RX (provider switch).
+// No-op if a session is still active — stop the session first.
+void soniox_client_deinit(void);
+
 // Idle low-power: stop/restart the mic codec (disables/enables the I2S so it releases its
 // NO_LIGHT_SLEEP lock, letting the CPU light-sleep when idle). mic_start() must precede a session.
 esp_err_t soniox_client_mic_stop(void);

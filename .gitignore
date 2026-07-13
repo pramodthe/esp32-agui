@@ -66,6 +66,8 @@ dependencies.lock
 .devcontainer/
 .vscode/
 .clangd
+# clangd / editor indexes (e.g. esp32-agui/.cache/clangd/)
+.cache/
 
 # --- Flash images — add later as a convenience ---
 *.bin

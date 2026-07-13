@@ -27,8 +27,9 @@
 
 #include "net_prov.h"
 #include "app_cfg.h"
-#include "soniox_client.h"
-#include "soniox_tts_client.h"
+#include "speech_stt.h"
+#include "speech_tts.h"
+#include "speech_cfg.h"
 #include "agui_client.h"
 #include "device_tools.h"
 #include "chat_ui.h"
@@ -141,9 +142,9 @@ static void h_text_delta(const char *d, void *c)
         // on ptt_task, so open() briefly stalls the SSE — lossless). If it can't open (e.g. concurrent-
         // TLS OOM), s_tts_streaming stays false and we fall back to batch after the run.
         if (!s_tts_streaming) {
-            if (soniox_tts_open() == ESP_OK) s_tts_streaming = true;
+            if (speech_tts_open() == ESP_OK) s_tts_streaming = true;
         }
-        if (s_tts_streaming) soniox_tts_feed(d);
+        if (s_tts_streaming) speech_tts_feed(d);
         // Always also buffer the whole reply: the batch fallback for a delta-less / open-failed turn.
         size_t dl = strlen(d);
         if (s_tts_len + dl < sizeof s_tts_text) {
@@ -272,14 +273,14 @@ static void run_agent_turn(const char *text)
 
     cJSON_Delete(tools);                           // cJSON_Delete(NULL) is safe
     if (s_aborting || s_run_error) {               // barge-in or real error → tear down any live stream
-        if (s_tts_streaming) { soniox_tts_cancel(); soniox_tts_wait_drained(3000); }  // BIT_CANCEL → quick close + unlock
+        if (s_tts_streaming) { speech_tts_cancel(); speech_tts_wait_drained(3000); }  // BIT_CANCEL → quick close + unlock
         s_responding = false;
         return;                                    // abort: new turn owns the UI; error: keep "Error" up
     }
     if (s_tts_streaming) {                          // P-b: the reply streamed live → finalize it
         chat_ui_status("Speaking...");
-        soniox_tts_finish();                        // text_end:true ONCE for the whole turn
-        soniox_tts_wait_drained(30000);             // play out the tail (30 s no-audio stall cap, not total)
+        speech_tts_finish();                        // text_end:true ONCE for the whole turn
+        speech_tts_wait_drained(30000);             // play out the tail (30 s no-audio stall cap, not total)
         if (s_aborting) { s_responding = false; return; }  // barged in during the spoken tail
     } else if (s_tts_len > 0) {                     // delta-less / streaming-open-failed → P-a batch fallback
         chat_ui_status("Speaking...");
@@ -292,7 +293,7 @@ static void run_agent_turn(const char *text)
 
 // ---- PTT "go ahead and talk" beep -------------------------------------------------------------
 // A short, subtle sine cue played on the ES8311 speaker the instant a hold starts. It plays from
-// ptt_task BEFORE soniox_session_start() creates capture_task, so it never glitches an in-flight
+// ptt_task BEFORE speech_stt_session_start() creates capture_task, so it never glitches an in-flight
 // mic read. The speaker is a second esp_codec_dev OUT handle that coexists with the always-open mic
 // IN handle on the single ES8311; both MUST use the same 16k/16/1 format (the shared codec/I2S
 // clock's last set_fs wins — and it is NOT auto-enforced, so BEEP_SR is hard-pinned). Opening the
@@ -392,7 +393,7 @@ static void tts_pcm_write(const void *pcm, size_t bytes)
 
 // Batch fallback used when streaming didn't open (delta-less / open-failed run). Volume is handled by
 // the sink (tts_pcm_write), so this is just the blocking speak.
-static void tts_speak_reply(const char *text) { soniox_tts_speak(text); }
+static void tts_speak_reply(const char *text) { speech_tts_speak(text); }
 
 // --- Volume control -----------------------------------------------------------------------------
 // BOOT single-click = volume up, PWR short-press = volume down. The button/PWR callbacks just bump
@@ -452,7 +453,7 @@ static void lp_wake(void)   // bring WiFi + codec back if shed; exactly-once
     if (s_lp_suspended) {
         s_lp_suspended = false;
         if (s_lp_lock) esp_pm_lock_acquire(s_lp_lock);   // no light sleep while active
-        soniox_client_mic_start();                       // re-enable the mic I2S (+ gain) for the turn
+        speech_stt_mic_start();                       // re-enable the mic I2S (+ gain) for the turn
         net_wifi_resume();
     }
     xSemaphoreGive(s_lp_mutex);
@@ -465,7 +466,7 @@ static void lp_idle(void)   // shed everything when idle — only on battery (pl
     xSemaphoreTake(s_lp_mutex, portMAX_DELAY);
     if (!s_lp_suspended) {
         s_lp_suspended = true;
-        soniox_client_mic_stop();                                // disable the mic I2S (RX)
+        speech_stt_mic_stop();                                // disable the mic I2S (RX)
         if (s_spk) { esp_codec_dev_close(s_spk); s_spk = NULL; s_spk_vol = -1; } // disable the speaker I2S (TX)
         net_wifi_suspend();
         if (s_lp_lock) esp_pm_lock_release(s_lp_lock);           // WiFi+I2S now off → allow light sleep
@@ -529,8 +530,8 @@ static void ptt_task(void *arg)
             turn_perf(true);                           // low-latency WiFi + 240 MHz CPU for the whole turn
             chat_ui_status("Listening...");
             play_ptt_beep();                           // "go ahead" cue; plays & returns before capture starts
-            soniox_cfg_t scfg = { 0 };                 // api_key from NVS
-            if (soniox_session_start(&scfg, on_partial, on_turn, NULL) != ESP_OK) {
+            speech_stt_cfg_t scfg = { 0 };               // api_key from NVS via speech_cfg
+            if (speech_stt_session_start(&scfg, on_partial, on_turn, NULL) != ESP_OK) {
                 s_listening = false;
                 turn_perf(false);                      // no turn will run; restore power-save now
                 chat_ui_status("STT error");
@@ -538,9 +539,9 @@ static void ptt_task(void *arg)
             }
         } else if (ev == 0 && s_listening) {           // RELEASE
             s_listening = false;
-            soniox_session_stop();                     // ws task is gone after this; buffers are stable
-            if (soniox_last_error()) {                 // STT upload/transport died (e.g. hotspot congestion)
-                ESP_LOGW(TAG, "STT failed: %s", soniox_last_error());
+            speech_stt_session_stop();                     // ws task is gone after this; buffers are stable
+            if (speech_stt_last_error()) {                 // STT upload/transport died (e.g. hotspot congestion)
+                ESP_LOGW(TAG, "STT failed: %s", speech_stt_last_error());
                 chat_ui_status("Network — hold to retry");   // don't silently drop the turn
                 turn_perf(false);
                 continue;
@@ -589,7 +590,7 @@ static void ptt_down_cb(void *btn, void *ctx)
         ESP_LOGI(TAG, "barge-in: aborting active reply");
         s_aborting = true;               // set BEFORE agui_abort so h_error (fires inline) suppresses "Error"
         agui_abort();                    // cancel the AG-UI run (no-op if already past it)
-        soniox_tts_cancel();             // stop TTS playback (no-op if not speaking)
+        speech_tts_cancel();             // stop TTS playback (no-op if not speaking)
     }
     int e = 1; xQueueSend(s_ptt_q, &e, 0);   // enqueue the press; ptt_task starts a fresh turn once unblocked
 }
@@ -607,7 +608,7 @@ static void talk_cb(int ev, void *ctx)
         ESP_LOGI(TAG, "barge-in (touch): aborting active reply");
         s_aborting = true;
         agui_abort();
-        soniox_tts_cancel();
+        speech_tts_cancel();
     }
     int e = ev; xQueueSend(s_ptt_q, &e, 0);
 }
@@ -717,7 +718,7 @@ void app_main(void)
     ESP_ERROR_CHECK(net_prov_init());
     for (;;) {
         bool wifi_ok = net_is_connected() || (net_connect_saved(15000) == ESP_OK);
-        bool key_ok  = app_cfg_has(APP_CFG_SONIOX_KEY);
+        bool key_ok  = speech_cfg_has_key();
         bool url_ok  = app_cfg_has(APP_CFG_AGUI_URL);
         if (wifi_ok && key_ok && url_ok) break;
         chat_ui_status("Setup: join 'AMOLED-setup'");
@@ -732,8 +733,8 @@ void app_main(void)
     ESP_LOGI(TAG, "network + keys ready");
 
     // Bring the mic up now; the Soniox WSS opens only on a PTT press.
-    if (soniox_client_init() != ESP_OK) ESP_LOGE(TAG, "mic init failed");
-    if (soniox_tts_init(tts_pcm_write) != ESP_OK) ESP_LOGE(TAG, "tts init failed");  // P-a: spoken replies
+    if (speech_stt_init() != ESP_OK) ESP_LOGE(TAG, "mic init failed");
+    if (speech_tts_init(tts_pcm_write) != ESP_OK) ESP_LOGE(TAG, "tts init failed");  // P-a: spoken replies
 
     // Spoken-reply volume from NVS (set by the volume buttons); default VOL_DEFAULT if unset.
     { char v[8]; if (app_cfg_get(APP_CFG_TTS_VOL, v, sizeof v)) { int n = atoi(v); if (n >= 0 && n <= 100) s_tts_vol = n; } }

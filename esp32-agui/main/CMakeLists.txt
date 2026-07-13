@@ -5,8 +5,9 @@ idf_component_register(
         nvs_flash
         net_prov
         app_cfg
-        soniox_client
-        soniox_tts_client
+        speech_cfg
+        speech_stt
+        speech_tts
         agui_client
         device_tools
         chat_ui

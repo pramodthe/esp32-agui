@@ -7,6 +7,7 @@
 // Opened only AFTER the AG-UI run has finished, so the TTS TLS never overlaps the SSE TLS (P-a
 // "sequential TLS"); streaming-while-the-run-speaks is P-b.
 #include "soniox_tts_client.h"
+#include "speech_cfg.h"
 
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -39,6 +40,7 @@ static const char *TAG = "tts";
 #define BIT_TERMINATED (1u << 1)
 #define BIT_WSERR      (1u << 2)
 #define BIT_CANCEL     (1u << 3)            // PTT barge-in: stop speaking NOW (set by soniox_tts_cancel)
+#define BIT_DRAIN_EXIT (1u << 4)            // deinit: ask drain task to exit
 
 typedef enum { TTS_IDLE, TTS_OPEN, TTS_FINISHING } tts_state_t;
 static tts_state_t                    s_state;    // lifecycle (ptt_task only); IDLE between turns
@@ -52,6 +54,7 @@ static StaticStreamBuffer_t           s_ring_ctrl;
 static uint8_t                       *s_ring_buf;
 static EventGroupHandle_t             s_eg;
 static SemaphoreHandle_t              s_lock;
+static TaskHandle_t                   s_drain_task;
 static char                          *s_rx;       // WS message reassembly (PSRAM)
 static size_t                         s_rx_total;
 static char                           s_api_key[APP_CFG_VAL_MAX];
@@ -61,9 +64,11 @@ static char                           s_voice[APP_CFG_VAL_MAX];   // portal-sele
 
 static void drain_task(void *arg)
 {
+    (void)arg;
     uint8_t *buf = heap_caps_malloc(DRAIN_CHUNK, MALLOC_CAP_DEFAULT);
-    if (!buf) { ESP_LOGE(TAG, "drain buf alloc failed"); vTaskDelete(NULL); return; }
+    if (!buf) { ESP_LOGE(TAG, "drain buf alloc failed"); s_drain_task = NULL; vTaskDelete(NULL); return; }
     for (;;) {
+        if (s_eg && (xEventGroupGetBits(s_eg) & BIT_DRAIN_EXIT)) break;
         size_t n = xStreamBufferReceive(s_ring, buf, DRAIN_CHUNK, pdMS_TO_TICKS(100));
         // Barge-in: keep RECEIVING (so the ring drains and speak() can finish) but DISCARD — don't
         // feed the codec. This empties the ring deterministically without an xStreamBufferReset
@@ -71,6 +76,9 @@ static void drain_task(void *arg)
         if (s_cancel) continue;
         if (n && s_sink) s_sink(buf, n);
     }
+    heap_caps_free(buf);
+    s_drain_task = NULL;
+    vTaskDelete(NULL);
 }
 
 // ---- websocket RX ----------------------------------------------------------
@@ -155,21 +163,40 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 
 esp_err_t soniox_tts_init(tts_pcm_sink_t sink)
 {
-    if (s_lock) return ESP_OK;            // already inited
     s_sink = sink;
-    s_eg = xEventGroupCreate();
-    s_lock = xSemaphoreCreateMutex();
-    s_send_mutex = xSemaphoreCreateMutex();
-    s_ring_buf = heap_caps_malloc(RING_BYTES, MALLOC_CAP_SPIRAM);
-    if (!s_eg || !s_lock || !s_send_mutex || !s_ring_buf) { ESP_LOGE(TAG, "init alloc failed"); return ESP_ERR_NO_MEM; }
-    s_ring = xStreamBufferCreateStatic(RING_BYTES, 1, s_ring_buf, &s_ring_ctrl);
-    if (!s_ring) return ESP_ERR_NO_MEM;
-    if (xTaskCreate(drain_task, "tts_drain", 3072, NULL, 5, NULL) != pdPASS) {
+    if (!s_eg) s_eg = xEventGroupCreate();
+    if (!s_lock) s_lock = xSemaphoreCreateMutex();
+    if (!s_send_mutex) s_send_mutex = xSemaphoreCreateMutex();
+    if (!s_eg || !s_lock || !s_send_mutex) { ESP_LOGE(TAG, "init alloc failed"); return ESP_ERR_NO_MEM; }
+    if (!s_ring_buf) {
+        s_ring_buf = heap_caps_malloc(RING_BYTES, MALLOC_CAP_SPIRAM);
+        if (!s_ring_buf) { ESP_LOGE(TAG, "ring alloc failed"); return ESP_ERR_NO_MEM; }
+        s_ring = xStreamBufferCreateStatic(RING_BYTES, 1, s_ring_buf, &s_ring_ctrl);
+        if (!s_ring) return ESP_ERR_NO_MEM;
+    }
+    if (s_drain_task) return ESP_OK;
+    xEventGroupClearBits(s_eg, BIT_DRAIN_EXIT);
+    if (xTaskCreate(drain_task, "tts_drain", 3072, NULL, 5, &s_drain_task) != pdPASS) {
         ESP_LOGE(TAG, "drain task create failed");
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "tts inited (ring %d KB PSRAM)", RING_BYTES / 1024);
     return ESP_OK;
+}
+
+void soniox_tts_deinit(void)
+{
+    if (!s_eg && !s_drain_task) return;
+    soniox_tts_cancel();
+    if (s_eg) xEventGroupSetBits(s_eg, BIT_DRAIN_EXIT);
+    for (int i = 0; i < 50 && s_drain_task; i++) vTaskDelay(pdMS_TO_TICKS(20));
+    if (s_ws) { esp_websocket_client_stop(s_ws); esp_websocket_client_destroy(s_ws); s_ws = NULL; }
+    if (s_rx) { heap_caps_free(s_rx); s_rx = NULL; }
+    if (s_ring_buf) { heap_caps_free(s_ring_buf); s_ring_buf = NULL; }
+    s_ring = NULL;
+    s_state = TTS_IDLE;
+    s_sink = NULL;
+    ESP_LOGI(TAG, "tts deinit");
 }
 
 static esp_err_t send_json_locked(cJSON *root)
@@ -206,8 +233,8 @@ esp_err_t soniox_tts_open(void)
     if (!s_lock || !s_sink) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
-    if (!app_cfg_get(APP_CFG_SONIOX_KEY, s_api_key, sizeof s_api_key)) {
-        ESP_LOGW(TAG, "no Soniox key for TTS");
+    if (!speech_cfg_get_key(s_api_key, sizeof s_api_key)) {
+        ESP_LOGW(TAG, "no speech API key for TTS");
         xSemaphoreGive(s_lock);
         return ESP_ERR_NOT_FOUND;
     }

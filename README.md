@@ -7,6 +7,8 @@ The device captures mic audio and streams it to **[Soniox](https://soniox.com)**
 speech-to-text, is itself the **AG-UI client** (it POSTs `RunAgentInput` and consumes the SSE
 event stream directly on-device), renders the conversation plus live agent activity on the
 1.8″ AMOLED via **LVGL 8.4**, and **speaks the reply back** with streaming Soniox text-to-speech.
+STT/TTS are also pluggable: **[Deepgram](https://deepgram.com)** (Listen / Speak v1) is available
+as an alternate provider from the captive portal (see [docs/speech-providers.md](docs/speech-providers.md)).
 Because the AG-UI client lives on the device, agent events (`TOOL_CALL_*`, reasoning, run
 lifecycle) drive the screen, and the board exposes its own sensors / screen / clock back to the
 agent as tools and ambient context.
@@ -27,6 +29,7 @@ mic ─ES8311/I²S(16k s16le)─▶ Soniox STT (streaming WSS) ─▶ live trans
    ─▶ reply text ─▶ Soniox TTS (streaming WSS) ─▶ ES8311 speaker  (barge-in to interrupt)
    ─▶ client tools run on-device (set_timer → ringing alarm)
 ```
+(Same pipeline with Deepgram when that provider is selected.)
 
 ---
 
@@ -107,6 +110,8 @@ esp32-agui/                      ← repo root
 |---|---|
 | [`agui_client`](esp32-agui/components/agui_client/) | Thin `extern "C"` shim over the vendored AG-UI SDK: POST `RunAgentInput` → handler callbacks |
 | [`agui_sdk`](esp32-agui/components/agui_sdk/) | Vendored + ESP-ported community C++ AG-UI SDK (streaming SSE parser, event router) |
+| [`speech_stt`](esp32-agui/components/speech_stt/) / [`speech_tts`](esp32-agui/components/speech_tts/) | Facades over Deepgram or Soniox (see [docs/speech-providers.md](docs/speech-providers.md)) |
+| [`deepgram_stt`](esp32-agui/components/deepgram_stt/) / [`deepgram_tts`](esp32-agui/components/deepgram_tts/) | Deepgram Listen / Speak v1 WSS backends |
 | [`soniox_client`](esp32-agui/components/soniox_client/) | ES8311 mic capture → Soniox WSS streaming STT → partial/final transcript callbacks |
 | [`soniox_tts_client`](esp32-agui/components/soniox_tts_client/) | Reply text → Soniox WSS streaming TTS → PCM → ES8311 speaker (cancelable for barge-in) |
 | [`chat_ui`](esp32-agui/components/chat_ui/) | LVGL chat bubbles, status line, touch-to-talk, configurable screen power saver, ringing-alarm overlay (uploaded graphic), idle screensaver |
@@ -196,10 +201,10 @@ are not emulated. Useful for boot / app-logic / networking, not the UI.
 1. **Provision.** With no saved credentials, the device starts a SoftAP captive portal named
    **`AMOLED-setup`**. Join it from a phone, and the form lets you set:
    - WiFi SSID + password
-   - **Soniox API key**
+   - **Soniox API key** (or switch **Speech provider** to Deepgram and enter a Deepgram key)
    - **AG-UI endpoint URL** (+ optional bearer token)
    - **Time zone** (POSIX `TZ` string, for the agent's ambient time context)
-   - **TTS voice** (dropdown of the 28 Soniox `tts-rt-v1` voices; default **Adrian**)
+   - **TTS voice** (Soniox `tts-rt-v1` voices, default **Adrian**; Deepgram Aura-2 voices when that provider is selected)
    - **Screen blank timeout** (seconds; default 60, `0` = always on)
    - **Idle animation** (checkbox; gently pulse the uploaded alarm image when idle)
    - **Alarm image** (file picker; any image is cropped in-browser to 240×240, converted to

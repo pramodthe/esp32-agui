@@ -283,6 +283,20 @@ esp_err_t soniox_client_init(void)
     return ESP_OK;
 }
 
+void soniox_client_deinit(void)
+{
+    if (s_active) {
+        ESP_LOGW(TAG, "deinit while session active — stop first");
+        soniox_session_stop();
+    }
+    if (s_mic) {
+        if (s_mic_open) { esp_codec_dev_close(s_mic); s_mic_open = false; }
+        esp_codec_dev_delete(s_mic);
+        s_mic = NULL;
+        ESP_LOGI(TAG, "mic released");
+    }
+}
+
 // Idle low-power: stop the mic codec when idle so the I2S RX channel is disabled and releases its
 // NO_LIGHT_SLEEP lock (a running I2S blocks light sleep). esp_codec_dev_close() disables the channel;
 // mic_start() reopens it (re-asserting the 30 dB gain) before a turn. Both idempotent.

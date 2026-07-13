@@ -10,11 +10,13 @@
 extern "C" {
 #endif
 
-#define APP_CFG_SONIOX_KEY "soniox_key"   // Soniox API key (permanent; ephemeral mint is P8)
+#define APP_CFG_SONIOX_KEY "soniox_key"   // legacy Soniox-only key (still read via speech_cfg)
+#define APP_CFG_SPEECH_PROVIDER "speech_prov" // "soniox" | "deepgram" (default soniox)
+#define APP_CFG_SPEECH_KEY "speech_key"   // active speech provider API key
 #define APP_CFG_AGUI_URL   "agui_url"     // AG-UI endpoint (P2)
 #define APP_CFG_AGUI_TOKEN "agui_token"   // AG-UI bearer (P2)
 #define APP_CFG_TZ         "tz"           // POSIX TZ string for local_time context (P5; default UTC0)
-#define APP_CFG_TTS_VOICE  "tts_voice"    // Soniox TTS voice name (P8; default "Adrian")
+#define APP_CFG_TTS_VOICE  "tts_voice"    // provider-specific TTS voice / model id
 #define APP_CFG_TTS_VOL    "tts_vol"      // spoken-reply volume 0-100 (volume buttons; default 90)
 #define APP_CFG_SCREEN_TO  "scr_to"       // screen blank timeout, seconds (default 60; 0 = always on)
 #define APP_CFG_IDLE_ANIM  "idle_anim"    // idle screensaver flag "0"/"1" (default 0; pulses alarm image)
