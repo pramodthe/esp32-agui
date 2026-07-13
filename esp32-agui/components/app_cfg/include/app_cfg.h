@@ -20,7 +20,6 @@ extern "C" {
 #define APP_CFG_TTS_VOL    "tts_vol"      // spoken-reply volume 0-100 (volume buttons; default 90)
 #define APP_CFG_SCREEN_TO  "scr_to"       // screen blank timeout, seconds (default 60; 0 = always on)
 #define APP_CFG_IDLE_ANIM  "idle_anim"    // idle screensaver flag "0"/"1" (default 0; pulses alarm image)
-
 // Max stored value length (incl. NUL). One number shared by the portal form, the NVS
 // writer, and every reader so a long value can't pass provisioning then fail to load.
 #define APP_CFG_VAL_MAX 192

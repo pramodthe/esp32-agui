@@ -12,6 +12,7 @@
 #include "driver/i2c_master.h"
 #include "bsp/esp32_s3_touch_amoled_1_8.h"
 #include "app_cfg.h"
+#include "imu_qmi8658.h"
 
 static const char *TAG = "device_tools";
 
@@ -29,6 +30,9 @@ esp_err_t device_tools_init(void)
     ESP_LOGI(TAG, "init");
     s_timer_q = xQueueCreate(1, sizeof(uint8_t));   // set_timer fire signal (block on it, don't poll)
     register_builtins();   // P7: register builtin client tools (set_timer, ...)
+    esp_err_t imu = imu_qmi8658_init();
+    if (imu != ESP_OK && imu != ESP_ERR_NOT_FOUND)
+        ESP_LOGW(TAG, "IMU init failed: %s", esp_err_to_name(imu));
     return ESP_OK;
 }
 
@@ -124,6 +128,26 @@ static void add_battery(cJSON *arr)
     ctx_add(arr, "battery", val);
 }
 
+bool device_tools_battery_read(int *percent_out, bool *plugged_out, char *status, size_t status_len)
+{
+    if (percent_out) *percent_out = -1;
+    if (plugged_out) *plugged_out = false;
+    if (status && status_len) status[0] = '\0';
+    if (!axp_ensure()) return false;
+    uint8_t s1, s2, pct;
+    if (axp_rd(AXP_REG_STATUS1, &s1) != ESP_OK || !(s1 & AXP_ST1_BAT_PRESENT)) return false;
+    if (axp_rd(AXP_REG_BAT_PERCENT, &pct) != ESP_OK || pct > 100) return false;
+    bool plugged  = (s1 & AXP_ST1_VBUS_GOOD) != 0;
+    bool charging = (axp_rd(AXP_REG_STATUS2, &s2) == ESP_OK) && ((s2 >> 5) == 0x01);
+    const char *st = !plugged ? "on battery"
+                   : charging ? "charging"
+                              : "plugged in, not charging";
+    if (percent_out) *percent_out = (int)pct;
+    if (plugged_out) *plugged_out = plugged;
+    if (status && status_len) strlcpy(status, st, status_len);
+    return true;
+}
+
 // PWR button (AXP2101 PWRKEY) short-press since the last call. The PMIC latches short/long-press
 // events in INTSTS2 (we poll it — the AXP IRQ pin isn't wired to a GPIO on this board). A long press
 // is a hardware power-off the PMIC does on its own, so only short presses are reported (used by the
@@ -157,6 +181,18 @@ static void add_voice(cJSON *arr)
     ctx_add(arr, "tts_voice", voice);
 }
 
+static void add_motion(cJSON *arr)
+{
+    if (!imu_qmi8658_ok()) return;
+    float roll = 0, pitch = 0;
+    imu_qmi8658_get_tilt(&roll, &pitch);
+    char val[128];
+    snprintf(val, sizeof val,
+             "{\"orientation\":\"%s\",\"roll_deg\":%.1f,\"pitch_deg\":%.1f,\"shake\":%.2f}",
+             imu_qmi8658_orientation(), roll, pitch, imu_qmi8658_shake_intensity());
+    ctx_add(arr, "device_motion", val);
+}
+
 cJSON *device_context_build(void)
 {
     cJSON *arr = cJSON_CreateArray();
@@ -165,7 +201,7 @@ cJSON *device_context_build(void)
     add_local_time(arr);
     add_battery(arr);
     add_voice(arr);
-    // Next P5 increment appends here: device_motion (QMI8658).
+    add_motion(arr);
 
     if (cJSON_GetArraySize(arr) == 0) {   // nothing to report yet → send no context
         cJSON_Delete(arr);
@@ -244,17 +280,52 @@ static esp_timer_handle_t s_timer_h;
 static volatile int64_t   s_timer_deadline_us;        // 0 = no active timer
 static volatile bool      s_timer_fired;
 static char               s_timer_label[40];
+// Serializes the fired/deadline/label trio, written by tool_set_timer (agent task) and
+// timer_fire_cb (esp_timer task) and read by device_tools_timer_take_fired (alert task). Without it a
+// replace-during-fire tears the label or lets a stale fire clobber the new deadline.
+static portMUX_TYPE       s_timer_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void timer_fire_cb(void *arg)
 {
     (void)arg;
+    char lbl[sizeof s_timer_label];
+    taskENTER_CRITICAL(&s_timer_mux);
     s_timer_deadline_us = 0;
     s_timer_fired = true;
+    strlcpy(lbl, s_timer_label, sizeof lbl);          // snapshot for the log outside the critical section
+    taskEXIT_CRITICAL(&s_timer_mux);
     if (s_timer_q) { uint8_t sig = 1; xQueueSend(s_timer_q, &sig, 0); }   // wake the alert task (cb runs in task ctx)
-    ESP_LOGI(TAG, "timer fired: %s", s_timer_label[0] ? s_timer_label : "(timer)");
+    ESP_LOGI(TAG, "timer fired: %s", lbl[0] ? lbl : "(timer)");
 }
 
 QueueHandle_t device_tools_timer_queue(void) { return s_timer_q; }
+
+// --- builtin: show_image --------------------------------------------------------------------
+static device_show_image_fn s_show_image_fn;
+
+void device_tools_set_show_image_handler(device_show_image_fn fn) { s_show_image_fn = fn; }
+
+static esp_err_t tool_show_image(const cJSON *args, cJSON **result)
+{
+    const cJSON *url = cJSON_GetObjectItemCaseSensitive(args, "url");
+    if (!cJSON_IsString(url) || !url->valuestring || !url->valuestring[0]) {
+        if (result) *result = cJSON_CreateString("error: 'url' is required");
+        return ESP_OK;
+    }
+    if (!s_show_image_fn) {
+        if (result) *result = cJSON_CreateString("error: show_image handler not wired");
+        return ESP_OK;
+    }
+    esp_err_t err = s_show_image_fn(url->valuestring);
+    if (err != ESP_OK) {
+        char msg[80];
+        snprintf(msg, sizeof msg, "error: display failed (%s)", esp_err_to_name(err));
+        if (result) *result = cJSON_CreateString(msg);
+        return ESP_OK;
+    }
+    if (result) *result = cJSON_CreateString("Image displayed on screen");
+    return ESP_OK;
+}
 
 static esp_err_t tool_set_timer(const cJSON *args, cJSON **result)
 {
@@ -265,8 +336,7 @@ static esp_err_t tool_set_timer(const cJSON *args, cJSON **result)
         if (result) *result = cJSON_CreateString("error: 'seconds' must be an integer 1..86400");
         return ESP_OK;                                // a (negative) tool RESULT, not a dispatch failure
     }
-    strlcpy(s_timer_label, (cJSON_IsString(label) && label->valuestring) ? label->valuestring : "",
-            sizeof s_timer_label);
+    const char *newlabel = (cJSON_IsString(label) && label->valuestring) ? label->valuestring : "";
     if (!s_timer_h) {
         const esp_timer_create_args_t ta = { .callback = timer_fire_cb, .name = "devtimer" };
         if (esp_timer_create(&ta, &s_timer_h) != ESP_OK) {
@@ -275,8 +345,15 @@ static esp_err_t tool_set_timer(const cJSON *args, cJSON **result)
         }
     }
     esp_timer_stop(s_timer_h);                        // replace any timer already running
+    int64_t deadline = esp_timer_get_time() + (int64_t)seconds * 1000000;
+    // Drain a fire the OLD timer may have already queued (queue depth 1) so a replaced timer can't
+    // surface as a phantom alarm, then set label + deadline + fired atomically vs timer_fire_cb.
+    if (s_timer_q) { uint8_t x; while (xQueueReceive(s_timer_q, &x, 0) == pdTRUE) {} }
+    taskENTER_CRITICAL(&s_timer_mux);
+    strlcpy(s_timer_label, newlabel, sizeof s_timer_label);
     s_timer_fired = false;
-    s_timer_deadline_us = esp_timer_get_time() + (int64_t)seconds * 1000000;
+    s_timer_deadline_us = deadline;
+    taskEXIT_CRITICAL(&s_timer_mux);
     esp_timer_start_once(s_timer_h, (uint64_t)seconds * 1000000);
     char msg[80];
     snprintf(msg, sizeof msg, "Timer set for %d second%s%s%s", seconds, seconds == 1 ? "" : "s",
@@ -295,10 +372,15 @@ int device_tools_timer_remaining(void)
 
 bool device_tools_timer_take_fired(char *label, size_t n)
 {
-    if (!s_timer_fired) return false;
-    s_timer_fired = false;
-    if (label && n) strlcpy(label, s_timer_label, n);
-    return true;
+    bool fired;
+    taskENTER_CRITICAL(&s_timer_mux);
+    fired = s_timer_fired;
+    if (fired) {
+        s_timer_fired = false;
+        if (label && n) strlcpy(label, s_timer_label, n);   // consistent label for THIS fire
+    }
+    taskEXIT_CRITICAL(&s_timer_mux);
+    return fired;
 }
 
 // Build a tool def {description, parameters} from a description + a JSON-Schema string.
@@ -323,5 +405,12 @@ static void register_builtins(void)
                  "\"label\":{\"type\":\"string\",\"description\":\"Optional short name for the timer\"}},"
                  "\"required\":[\"seconds\"]}"),
         tool_set_timer);
+    device_tools_register(
+        "show_image",
+        tool_def("Display an image on the device screen from an HTTPS JPEG URL.",
+                 "{\"type\":\"object\",\"properties\":{"
+                 "\"url\":{\"type\":\"string\",\"description\":\"HTTPS URL of a JPEG image\"}},"
+                 "\"required\":[\"url\"]}"),
+        tool_show_image);
     // set_alarm (PCF85063 RTC) and show_qr (lv_qrcode) register here next.
 }

@@ -28,6 +28,28 @@ void  chat_ui_clear_status(void);
 void  chat_ui_show_qr(const char *data);   // lv_qrcode
 void  chat_ui_idle_timer(int seconds_left, const char *label);
 
+// NIMO-style companion face moods. HIDDEN shows chat (or other non-eyes pages).
+// Non-clickable face layer so long-press PTT still works; short tap cycles pages.
+typedef enum {
+    CHAT_UI_FACE_IDLE = 0,
+    CHAT_UI_FACE_LISTEN,
+    CHAT_UI_FACE_THINK,
+    CHAT_UI_FACE_SPEAK,
+    CHAT_UI_FACE_HAPPY,
+    CHAT_UI_FACE_SLEEPY,
+    CHAT_UI_FACE_SAD,
+    CHAT_UI_FACE_ANGRY,
+    CHAT_UI_FACE_SURPRISED,
+    CHAT_UI_FACE_DIZZY,
+    CHAT_UI_FACE_LOVE,
+    CHAT_UI_FACE_SUSPICIOUS,
+    CHAT_UI_FACE_HIDDEN,
+} chat_ui_face_mood_t;
+void  chat_ui_set_face(chat_ui_face_mood_t mood);
+
+// Download a JPEG from `url`, decode to RGB565, show as a full-screen overlay (tap to dismiss).
+esp_err_t chat_ui_show_image(const char *url);
+
 // Screen-power saver: blank the AMOLED (brightness 0) after `idle_timeout_s` of no touch /
 // PTT / UI activity, and wake it on any of those. Pass 0 for "always on" (never blank); >0 sets
 // the timeout in seconds. (The PWR button no longer toggles the screen — it's volume-down now, so

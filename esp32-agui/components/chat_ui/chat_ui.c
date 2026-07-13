@@ -5,15 +5,21 @@
 // each wraps its LVGL work in bsp_display_lock()/unlock(). Interrupt prompt + QR are P6.
 
 #include "chat_ui.h"
+#include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "esp_http_client.h"
+#include "jpeg_decoder.h"
 #include "bsp/esp32_s3_touch_amoled_1_8.h"
 #include "device_tools.h"
 #include "alarm_img.h"
 #include "lvgl.h"
+#include "face_engine.h"
+#include "companion_pages.h"
 
 static const char *TAG = "chat_ui";
 
@@ -40,9 +46,62 @@ static const char *TAG = "chat_ui";
 
 static lv_obj_t *s_chat;         // scrollable flex column of message rows
 static lv_obj_t *s_status;       // top status label
+static lv_obj_t *s_status_box;   // clipping box for status (kept above the face)
 static lv_obj_t *s_assist_lbl;   // label of the in-progress assistant bubble (streaming)
 static char      s_assist_buf[2048];   // accumulated assistant text (to re-measure on each delta)
 static size_t    s_assist_len;
+
+// --- show_image overlay ----------------------------------------------------------------------
+static lv_obj_t    *s_img_overlay;
+static lv_obj_t    *s_img_view;
+static lv_img_dsc_t s_img_dsc;
+static uint8_t     *s_img_pixels;     // RGB565 in PSRAM
+static uint16_t     s_img_w, s_img_h;
+
+// Forward decls used by page-tap / face helpers (defined with screen-power / talk code below).
+static volatile bool s_alarm_active;
+static bool          s_talk_armed;
+
+// --- NIMO-style face + companion pages (Eyes/Clock/Chat) ------------------------------------
+static void chat_ui_page_tap_cb(lv_event_t *e)
+{
+    if (s_alarm_active) return;
+    if (s_talk_armed) return;   // long-press PTT owns this gesture
+    if (lv_event_get_code(e) != LV_EVENT_SHORT_CLICKED) return;
+    companion_pages_cycle();
+}
+
+void chat_ui_set_face(chat_ui_face_mood_t mood)
+{
+    if (!bsp_display_lock(1000)) {
+        face_engine_set_mood(mood == CHAT_UI_FACE_HIDDEN ? CHAT_UI_FACE_IDLE : mood);
+        return;
+    }
+    if (mood == CHAT_UI_FACE_HIDDEN) {
+        face_engine_set_mood(CHAT_UI_FACE_IDLE);
+        companion_pages_show(COMPANION_PAGE_CHAT);
+    } else {
+        face_engine_set_mood(mood);
+        companion_page_t cur = companion_pages_current();
+        if (cur == COMPANION_PAGE_CHAT || cur == COMPANION_PAGE_EYES)
+            companion_pages_show(COMPANION_PAGE_EYES);
+        if (s_status_box) lv_obj_move_foreground(s_status_box);
+    }
+    bsp_display_unlock();
+}
+
+static void face_from_status(const char *text)
+{
+    if (!text || !text[0]) return;
+    companion_pages_on_voice_status(text);
+    if (!strncmp(text, "Listening", 9))      chat_ui_set_face(CHAT_UI_FACE_LISTEN);
+    else if (!strncmp(text, "Thinking", 8) ||
+             !strncmp(text, "Reasoning", 9) ||
+             !strncmp(text, "Using ", 6))    chat_ui_set_face(CHAT_UI_FACE_THINK);
+    else if (!strncmp(text, "Speaking", 8))  chat_ui_set_face(CHAT_UI_FACE_SPEAK);
+    else if (!strncmp(text, "Hold ", 5) ||
+             !strcmp(text, "Ready"))         chat_ui_set_face(CHAT_UI_FACE_HAPPY);
+}
 
 // Make text renderable by the (Latin-only) Montserrat font: transliterate common punctuation
 // (em/en dash, curly quotes, ellipsis, nbsp) to ASCII, and DROP any other multi-byte codepoint
@@ -160,13 +219,13 @@ esp_err_t chat_ui_init(void)
     // Status line: a fixed-width clipping box holding a single-line label. Long live transcripts
     // scroll left so the tail (latest words) stays on screen; short messages center. (clips to the
     // box edges, respecting the round-corner safe zone — not the screen edge.)
-    lv_obj_t *box = lv_obj_create(scr);
-    lv_obj_remove_style_all(box);
-    lv_obj_set_size(box, CHAT_W, STATUS_H);
-    lv_obj_align(box, LV_ALIGN_TOP_MID, 0, SAFE_INSET);
-    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    s_status_box = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_status_box);
+    lv_obj_set_size(s_status_box, CHAT_W, STATUS_H);
+    lv_obj_align(s_status_box, LV_ALIGN_TOP_MID, 0, SAFE_INSET);
+    lv_obj_clear_flag(s_status_box, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_status = lv_label_create(box);
+    s_status = lv_label_create(s_status_box);
     lv_label_set_long_mode(s_status, LV_LABEL_LONG_CLIP);   // one line, full content width, no dots
     lv_obj_set_style_text_color(s_status, lv_palette_main(LV_PALETTE_GREY), 0);
     lv_obj_set_style_text_font(s_status, CHAT_FONT, 0);
@@ -184,6 +243,10 @@ esp_err_t chat_ui_init(void)
     lv_obj_set_scroll_dir(s_chat, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_chat, LV_SCROLLBAR_MODE_OFF);
 
+    face_engine_create(scr);                           // Eyes page (spring-physics face)
+    companion_pages_create(scr);                       // Clock overlay
+    lv_obj_move_foreground(s_status_box);
+
     // Touch/scroll = activity for the screen-power saver. This event cb runs INSIDE the LVGL task
     // (already holding lvgl_mutex), so it bumps s_last_activity_ms without ever taking a lock — i.e.
     // it works even when screen_power_task can't grab the lock to read lv_disp_get_inactive_time().
@@ -198,10 +261,20 @@ esp_err_t chat_ui_init(void)
     // (presses over the blank/status area) AND the chat list (which covers most of the screen — a press
     // there goes to s_chat and does NOT bubble to scr). A drag on the chat still scrolls, because LVGL
     // suppresses LONG_PRESSED once a scroll begins; a still hold fires it.
+    // Handle PRESS_LOST as well as RELEASED: a hold that ends any way other than a clean lift — the
+    // gesture turning into a scroll, focus change, or a stuck/phantom capacitive touch — emits
+    // LV_EVENT_PRESS_LOST, NOT RELEASED. Without it, s_talk_armed never clears and the app latches in
+    // "Listening..." forever (the release cb never fires). Register both exit events on both objects.
     lv_obj_add_event_cb(scr,    chat_ui_talk_evt_cb, LV_EVENT_LONG_PRESSED, NULL);
     lv_obj_add_event_cb(scr,    chat_ui_talk_evt_cb, LV_EVENT_RELEASED,     NULL);
+    lv_obj_add_event_cb(scr,    chat_ui_talk_evt_cb, LV_EVENT_PRESS_LOST,   NULL);
     lv_obj_add_event_cb(s_chat, chat_ui_talk_evt_cb, LV_EVENT_LONG_PRESSED, NULL);
     lv_obj_add_event_cb(s_chat, chat_ui_talk_evt_cb, LV_EVENT_RELEASED,     NULL);
+    lv_obj_add_event_cb(s_chat, chat_ui_talk_evt_cb, LV_EVENT_PRESS_LOST,   NULL);
+
+    // Short tap cycles Eyes → Clock → Chat (long-press still owns PTT via s_talk_armed).
+    lv_obj_add_event_cb(scr,    chat_ui_page_tap_cb, LV_EVENT_SHORT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_chat, chat_ui_page_tap_cb, LV_EVENT_SHORT_CLICKED, NULL);
 
     // Raise the touch scroll threshold so a STILL hold (with the few px of capacitive jitter) over the
     // scrollable chat isn't read as a scroll — which would cancel the long-press. A deliberate drag
@@ -220,6 +293,7 @@ esp_err_t chat_ui_init(void)
 void chat_ui_add_user(const char *text)
 {
     chat_ui_note_activity();
+    chat_ui_set_face(CHAT_UI_FACE_HIDDEN);   // flip to chat for reading
     if (!s_chat || !bsp_display_lock(1000)) return;
     add_bubble(true, COL_USER, text);
     scroll_bottom();
@@ -229,6 +303,7 @@ void chat_ui_add_user(const char *text)
 void *chat_ui_begin_assistant(void)
 {
     chat_ui_note_activity();
+    chat_ui_set_face(CHAT_UI_FACE_HIDDEN);   // flip to chat while the reply streams
     if (!s_chat || !bsp_display_lock(1000)) return NULL;
     s_assist_buf[0] = '\0'; s_assist_len = 0;
     s_assist_lbl = add_bubble(false, COL_ASSIST, "");
@@ -283,6 +358,7 @@ void chat_ui_append_assistant(const char *delta)
 void chat_ui_status(const char *text)
 {
     chat_ui_note_activity();
+    face_from_status(text);
     if (!s_status || !bsp_display_lock(1000)) return;
     char clean[1024];                              // live transcript can be long
     sanitize(text ? text : "", clean, sizeof clean);
@@ -291,6 +367,7 @@ void chat_ui_status(const char *text)
     lv_coord_t lw = lv_obj_get_width(s_status), bw = CHAT_W;
     lv_obj_set_x(s_status, lw > bw ? (bw - lw)      // overflow → show the tail (scroll left)
                                    : (bw - lw) / 2); // fits → center
+    if (s_status_box) lv_obj_move_foreground(s_status_box);
     bsp_display_unlock();
 }
 
@@ -308,7 +385,6 @@ static bool              s_idle_disabled;               // "always on": never bl
 static bool              s_screen_on = true;
 static bool              s_force_off_armed;             // PWR-tapped off; stays off until newer activity
 static uint32_t          s_force_off_ms;                // when the force-off press happened
-static volatile bool     s_alarm_active;                // a timer is ringing → it owns the screen
 static lv_obj_t         *s_alarm_overlay;               // full-screen black overlay shown while ringing
 static lv_obj_t         *s_alarm_ring;                  // default graphic: red ring (toggled to flash)
 static lv_obj_t         *s_alarm_img;                   // user graphic (if uploaded): pulsed via img_opa
@@ -514,7 +590,6 @@ void chat_ui_set_power_cb(chat_ui_power_cb cb) { s_power_cb = cb; }
 // with the display lock already held, so it only flips flags + calls the (non-blocking) app callback.
 static chat_ui_talk_cb s_talk_cb;
 static void           *s_talk_ctx;
-static bool            s_talk_armed;
 void chat_ui_set_talk_cb(chat_ui_talk_cb cb, void *ctx) { s_talk_cb = cb; s_talk_ctx = ctx; }
 
 static void chat_ui_talk_evt_cb(lv_event_t *e)
@@ -526,9 +601,9 @@ static void chat_ui_talk_evt_cb(lv_event_t *e)
         ESP_LOGI(TAG, "touch-to-talk: hold");
         s_talk_armed = true;
         if (s_talk_cb) s_talk_cb(1, s_talk_ctx);     // hold start → like a BOOT down
-    } else if (code == LV_EVENT_RELEASED) {
-        if (s_talk_armed && s_talk_cb) s_talk_cb(0, s_talk_ctx);   // release → stop + run
-        s_talk_armed = false;
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        if (s_talk_armed && s_talk_cb) s_talk_cb(0, s_talk_ctx);   // release/press-lost → stop + run
+        s_talk_armed = false;                                     // always disarm, even if never armed
     }
 }
 
@@ -638,6 +713,185 @@ void chat_ui_screen_power_start(int idle_timeout_s)
     else
         ESP_LOGI(TAG, "screen-power saver: blank after %us idle (wake on touch / PWR key / activity)",
                  (unsigned)(s_idle_timeout_ms / 1000));
+}
+
+// --- show_image: HTTPS JPEG → RGB565 overlay ------------------------------------------------
+#define IMG_DL_MAX       (300 * 1024)
+#define IMG_DISP_MAX_W   320
+#define IMG_DISP_MAX_H   320
+
+static void img_overlay_dismiss(void)
+{
+    if (bsp_display_lock(1000)) {
+        if (s_img_overlay) {
+            lv_obj_del(s_img_overlay);
+            s_img_overlay = NULL;
+            s_img_view = NULL;
+        }
+        if (s_img_pixels) {
+            heap_caps_free(s_img_pixels);
+            s_img_pixels = NULL;
+        }
+        s_img_w = s_img_h = 0;
+        if (s_status_box) lv_obj_move_foreground(s_status_box);
+        bsp_display_unlock();
+    }
+    chat_ui_note_activity();
+}
+
+static void img_overlay_evt(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) img_overlay_dismiss();
+}
+
+static esp_err_t http_get_psram(const char *url, uint8_t **out, int *out_len)
+{
+    *out = NULL;
+    *out_len = 0;
+    uint8_t *buf = heap_caps_malloc(IMG_DL_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) return ESP_ERR_NO_MEM;
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .timeout_ms = 20000,
+        .buffer_size = 4096,
+        .buffer_size_tx = 1024,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) { heap_caps_free(buf); return ESP_FAIL; }
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "http open: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        heap_caps_free(buf);
+        return err;
+    }
+    (void)esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    int total = 0;
+    while (total < IMG_DL_MAX) {
+        int n = esp_http_client_read(client, (char *)buf + total, IMG_DL_MAX - total);
+        if (n < 0) { err = ESP_FAIL; break; }
+        if (n == 0) break;
+        total += n;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status < 200 || status >= 300 || total < 16) {
+        ESP_LOGE(TAG, "http get failed status=%d len=%d", status, total);
+        heap_caps_free(buf);
+        return ESP_FAIL;
+    }
+    *out = buf;
+    *out_len = total;
+    return ESP_OK;
+}
+
+static esp_err_t jpeg_to_rgb565(const uint8_t *jpg, int jpg_len,
+                                uint8_t **pixels, uint16_t *w, uint16_t *h)
+{
+    // Largest-first: pick the biggest scale whose DECODED dims fit the display cap. esp_jpeg_get_image_info
+    // reports full-resolution width/height regardless of out_scale (only output_len is scaled), so the
+    // fit test must divide by the scale divisor. The old code compared full-res against the cap, so any
+    // image wider than the cap was rejected at every scale (never shown) and small ones were shrunk to 1/4.
+    static const struct { esp_jpeg_image_scale_t scale; int div; } scales[] = {
+        { JPEG_IMAGE_SCALE_0,   1 },
+        { JPEG_IMAGE_SCALE_1_2, 2 },
+        { JPEG_IMAGE_SCALE_1_4, 4 },
+        { JPEG_IMAGE_SCALE_1_8, 8 },
+    };
+    for (size_t i = 0; i < sizeof scales / sizeof scales[0]; i++) {
+        esp_jpeg_image_cfg_t probe = {
+            .indata = (uint8_t *)jpg,
+            .indata_size = (uint32_t)jpg_len,
+            .outbuf = NULL,
+            .outbuf_size = 0,
+            .out_format = JPEG_IMAGE_FORMAT_RGB565,
+            .out_scale = scales[i].scale,
+            .flags = { .swap_color_bytes = 1 },
+        };
+        esp_jpeg_image_output_t info = {0};
+        if (esp_jpeg_get_image_info(&probe, &info) != ESP_OK || info.width == 0 || info.height == 0)
+            continue;
+        if (info.width / scales[i].div > IMG_DISP_MAX_W || info.height / scales[i].div > IMG_DISP_MAX_H)
+            continue;   // decoded size still too big at this scale → try the next smaller scale
+
+        size_t need = info.output_len ? info.output_len : (size_t)info.width * info.height * 2;
+        uint8_t *out = heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!out) continue;
+
+        esp_jpeg_image_cfg_t cfg = probe;
+        cfg.outbuf = out;
+        cfg.outbuf_size = need;
+        esp_jpeg_image_output_t decoded = {0};
+        if (esp_jpeg_decode(&cfg, &decoded) == ESP_OK && decoded.width > 0) {
+            *pixels = out;
+            *w = decoded.width;
+            *h = decoded.height;
+            ESP_LOGI(TAG, "jpeg decoded %ux%u scale=1/%d", (unsigned)*w, (unsigned)*h, scales[i].div);
+            return ESP_OK;
+        }
+        heap_caps_free(out);
+    }
+    return ESP_FAIL;
+}
+
+esp_err_t chat_ui_show_image(const char *url)
+{
+    if (!url || !url[0]) return ESP_ERR_INVALID_ARG;
+    chat_ui_note_activity();
+    img_overlay_dismiss();   // replace any previous image
+
+    uint8_t *jpg = NULL;
+    int jpg_len = 0;
+    esp_err_t err = http_get_psram(url, &jpg, &jpg_len);
+    if (err != ESP_OK) return err;
+
+    uint8_t *pix = NULL;
+    uint16_t w = 0, h = 0;
+    err = jpeg_to_rgb565(jpg, jpg_len, &pix, &w, &h);
+    heap_caps_free(jpg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "jpeg decode failed");
+        return err;
+    }
+
+    if (!bsp_display_lock(2000)) {
+        heap_caps_free(pix);
+        return ESP_ERR_TIMEOUT;
+    }
+    s_img_pixels = pix;
+    s_img_w = w;
+    s_img_h = h;
+    memset(&s_img_dsc, 0, sizeof s_img_dsc);
+    s_img_dsc.header.always_zero = 0;
+    s_img_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+    s_img_dsc.header.w = w;
+    s_img_dsc.header.h = h;
+    s_img_dsc.data_size = (uint32_t)w * h * 2;
+    s_img_dsc.data = s_img_pixels;
+
+    s_img_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(s_img_overlay);
+    lv_obj_set_size(s_img_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(s_img_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_img_overlay, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s_img_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_img_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_img_overlay, img_overlay_evt, LV_EVENT_CLICKED, NULL);
+
+    s_img_view = lv_img_create(s_img_overlay);
+    lv_img_set_src(s_img_view, &s_img_dsc);
+    lv_obj_center(s_img_view);
+    lv_obj_clear_flag(s_img_view, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (s_status_box) lv_obj_move_foreground(s_status_box);
+    bsp_display_unlock();
+    chat_ui_set_face(CHAT_UI_FACE_HIDDEN);
+    ESP_LOGI(TAG, "show_image ok %ux%u", (unsigned)w, (unsigned)h);
+    return ESP_OK;
 }
 
 // --- later phases ---

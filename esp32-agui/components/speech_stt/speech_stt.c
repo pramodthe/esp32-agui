@@ -61,13 +61,17 @@ esp_err_t speech_stt_session_start(const speech_stt_cfg_t *cfg,
                                    speech_stt_partial_cb on_partial,
                                    speech_stt_turn_cb on_turn, void *ctx)
 {
-    if (ensure_backend() != ESP_OK) return ESP_FAIL;
+    if (ensure_backend() != ESP_OK) {
+        ESP_LOGE(TAG, "STT backend init failed");
+        return ESP_FAIL;
+    }
 
     char key[APP_CFG_VAL_MAX];
     const char *api_key = (cfg && cfg->api_key) ? cfg->api_key : NULL;
     if (!api_key) {
         if (!speech_cfg_get_key(key, sizeof key)) {
-            ESP_LOGE(TAG, "no speech API key — set via portal");
+            ESP_LOGE(TAG, "no speech API key — set via portal (provider=%s)",
+                     speech_provider_name(speech_provider_get()));
             return ESP_ERR_NOT_FOUND;
         }
         api_key = key;
@@ -75,44 +79,64 @@ esp_err_t speech_stt_session_start(const speech_stt_cfg_t *cfg,
 
     speech_provider_t p = speech_provider_get();
     ESP_LOGI(TAG, "session_start provider=%s", speech_provider_name(p));
-    if (p == SPEECH_PROVIDER_SONIOX) {
-        soniox_cfg_t sc = {
-            .endpoint = cfg ? cfg->endpoint : NULL,
-            .api_key = api_key,
-            .model = cfg ? cfg->model : NULL,
-            .sample_rate = cfg ? cfg->sample_rate : 0,
-        };
-        return soniox_session_start(&sc, on_partial, on_turn, ctx);
+
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (p == SPEECH_PROVIDER_SONIOX) {
+            soniox_cfg_t sc = {
+                .endpoint = cfg ? cfg->endpoint : NULL,
+                .api_key = api_key,
+                .model = cfg ? cfg->model : NULL,
+                .sample_rate = cfg ? cfg->sample_rate : 0,
+            };
+            err = soniox_session_start(&sc, on_partial, on_turn, ctx);
+        } else {
+            deepgram_stt_cfg_t dc = {
+                .endpoint = cfg ? cfg->endpoint : NULL,
+                .api_key = api_key,
+                .model = cfg ? cfg->model : NULL,
+                .sample_rate = cfg ? cfg->sample_rate : 0,
+            };
+            err = deepgram_stt_session_start(&dc, on_partial, on_turn, ctx);
+        }
+        // Prior turn left the session stuck open → clear and retry once.
+        if (err == ESP_ERR_INVALID_STATE && attempt == 0) {
+            ESP_LOGW(TAG, "stale STT session — forcing stop + retry");
+            speech_stt_session_stop();
+            continue;
+        }
+        break;
     }
-    deepgram_stt_cfg_t dc = {
-        .endpoint = cfg ? cfg->endpoint : NULL,
-        .api_key = api_key,
-        .model = cfg ? cfg->model : NULL,
-        .sample_rate = cfg ? cfg->sample_rate : 0,
-    };
-    return deepgram_stt_session_start(&dc, on_partial, on_turn, ctx);
+    return err;
 }
 
+// Route session-lifecycle calls off s_inited_for (the backend that actually owns the running session),
+// NOT a live speech_provider_get() — a portal provider switch mid-session would otherwise dispatch
+// stop/finalize/error to the wrong backend and leak the ES8311 mic. (In the current flow the portal
+// and sessions are mutually exclusive on ptt_task, so this is hardening, not a live bug.)
 esp_err_t speech_stt_session_finalize(void)
 {
-    return (speech_provider_get() == SPEECH_PROVIDER_SONIOX)
-               ? soniox_session_finalize() : deepgram_stt_session_finalize();
+    if (s_inited_for == SPEECH_PROVIDER_SONIOX)   return soniox_session_finalize();
+    if (s_inited_for == SPEECH_PROVIDER_DEEPGRAM) return deepgram_stt_session_finalize();
+    return ESP_ERR_INVALID_STATE;
 }
 
 void speech_stt_session_stop(void)
 {
-    if (speech_provider_get() == SPEECH_PROVIDER_SONIOX) soniox_session_stop();
-    else deepgram_stt_session_stop();
+    if (s_inited_for == SPEECH_PROVIDER_SONIOX)        soniox_session_stop();
+    else if (s_inited_for == SPEECH_PROVIDER_DEEPGRAM) deepgram_stt_session_stop();
 }
 
 bool speech_stt_session_active(void)
 {
-    return (speech_provider_get() == SPEECH_PROVIDER_SONIOX)
-               ? soniox_session_active() : deepgram_stt_session_active();
+    if (s_inited_for == SPEECH_PROVIDER_SONIOX)   return soniox_session_active();
+    if (s_inited_for == SPEECH_PROVIDER_DEEPGRAM) return deepgram_stt_session_active();
+    return false;
 }
 
 const char *speech_stt_last_error(void)
 {
-    return (speech_provider_get() == SPEECH_PROVIDER_SONIOX)
-               ? soniox_last_error() : deepgram_stt_last_error();
+    if (s_inited_for == SPEECH_PROVIDER_SONIOX)   return soniox_last_error();
+    if (s_inited_for == SPEECH_PROVIDER_DEEPGRAM) return deepgram_stt_last_error();
+    return NULL;
 }

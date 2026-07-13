@@ -41,6 +41,8 @@ static const char *TAG = "esp32_agui";
 
 #define PTT_GPIO    0                 // BOOT button: strapping pin at RESET only; normal input at runtime
 #define IDLE_HINT   "Hold Top Button to talk"
+#define PTT_MAX_LISTEN_MS 30000       // watchdog: force-stop a hold that never sees its release (a touch
+                                      // PRESS_LOST or a stuck/phantom touch) so it can't wedge "Listening..."
 
 static QueueHandle_t s_ptt_q;          // button events: 1 = press (down), 0 = release (up)
 static volatile bool s_listening;      // a hold is in progress
@@ -220,6 +222,9 @@ static void run_agent_turn(const char *text)
     }
     bool have_tok = app_cfg_get(APP_CFG_AGUI_TOKEN, token, sizeof token);
 
+    s_aborting       = false;                      // clear any stale barge-in flag BEFORE we become
+                                                   // interruptible (a dropped barge-in press could
+                                                   // otherwise leave it set → this turn bails silently)
     s_responding     = true;                       // P-c: a BOOT press from here on is a barge-in
     s_assist_started = false;
     s_run_error      = false;
@@ -320,6 +325,10 @@ static void run_agent_turn(const char *text)
 #endif
 
 static esp_codec_dev_handle_t s_spk;              // speaker OUT handle, opened once and kept open
+// Declared here (used by the speaker helpers below): it guards s_spk close (lp_idle, screen-power task)
+// against beep/vol-tick writes, and doubles as the low-power suspend/resume critical section. Created in
+// power_mgmt_start(), which runs before ptt_task/timers, so it's non-NULL by the time any of them write.
+static SemaphoreHandle_t      s_lp_mutex;
 static int16_t s_cue_pcm[BEEP_SAMPLES];           // PTT cue (subtle)
 static int16_t s_alarm_pcm[BEEP_SAMPLES];         // timer alarm (loud, higher)
 static bool    s_beep_ready;
@@ -374,9 +383,13 @@ static void play_beep(const int16_t *pcm)
         fill_tone(s_cue_pcm, CUE_FREQ, CUE_AMPL);   // alarm buffer at its current escalation level
         s_beep_ready = true;
     }
-    if (!spk_ensure()) return;
-    spk_set_vol(BEEP_VOL);
-    esp_codec_dev_write(s_spk, (int16_t *)pcm, BEEP_SAMPLES * sizeof(int16_t));   // API wants non-const
+    // Hold s_lp_mutex across ensure+write so lp_idle (screen-power task) can't close s_spk mid-write.
+    if (s_lp_mutex) xSemaphoreTake(s_lp_mutex, portMAX_DELAY);
+    if (spk_ensure()) {
+        spk_set_vol(BEEP_VOL);
+        esp_codec_dev_write(s_spk, (int16_t *)pcm, BEEP_SAMPLES * sizeof(int16_t));   // API wants non-const
+    }
+    if (s_lp_mutex) xSemaphoreGive(s_lp_mutex);
 }
 
 static void play_ptt_beep(void) { play_beep(s_cue_pcm); }   // PTT "go ahead" cue (existing call sites)
@@ -419,9 +432,12 @@ static void vol_bump(int delta)             // runs in a button/screen cb — in
 static void play_vol_tick(void)
 {
     if (!s_beep_ready) { fill_tone(s_cue_pcm, CUE_FREQ, CUE_AMPL); s_beep_ready = true; }
-    if (!spk_ensure()) return;
-    spk_set_vol(s_tts_vol);
-    esp_codec_dev_write(s_spk, s_cue_pcm, BEEP_SAMPLES * sizeof(int16_t));
+    if (s_lp_mutex) xSemaphoreTake(s_lp_mutex, portMAX_DELAY);   // vs lp_idle closing s_spk mid-write
+    if (spk_ensure()) {
+        spk_set_vol(s_tts_vol);
+        esp_codec_dev_write(s_spk, s_cue_pcm, BEEP_SAMPLES * sizeof(int16_t));
+    }
+    if (s_lp_mutex) xSemaphoreGive(s_lp_mutex);
 }
 
 static void vol_feedback(void)              // ptt_task ev=3/4 handler
@@ -442,7 +458,8 @@ static void vol_feedback(void)              // ptt_task ev=3/4 handler
 // lp_idle sheds WiFi + the codec and releases the lock so the CPU light-sleeps; lp_wake reverses it.
 // Plugged-in stays fully on (lp_idle is a no-op on USB), so no latency cost there.
 static volatile bool        s_lp_suspended;
-static SemaphoreHandle_t    s_lp_mutex;
+static volatile bool        s_alarm_ringing;   // a ringing timer owns the speaker → gate lp_idle off it
+// s_lp_mutex is declared earlier (near s_spk) so the speaker helpers can serialize against lp_idle.
 static esp_pm_lock_handle_t s_lp_lock;     // NO_LIGHT_SLEEP — HELD while active, released only when idle
 static esp_pm_lock_handle_t s_cpu_lock;    // CPU_FREQ_MAX  — HELD only for the duration of a turn (latency)
 
@@ -462,7 +479,7 @@ static void lp_wake(void)   // bring WiFi + codec back if shed; exactly-once
 static void lp_idle(void)   // shed everything when idle — only on battery (plugged-in stays connected)
 {
     // Never shed mid-response (a long spoken reply can outlast the 60 s screen-idle blank).
-    if (!s_lp_mutex || s_lp_suspended || s_responding || !device_tools_on_battery()) return;
+    if (!s_lp_mutex || s_lp_suspended || s_responding || s_alarm_ringing || !device_tools_on_battery()) return;
     xSemaphoreTake(s_lp_mutex, portMAX_DELAY);
     if (!s_lp_suspended) {
         s_lp_suspended = true;
@@ -506,9 +523,25 @@ static void turn_perf(bool on)
 // PTT state machine: press → open STT + stream; release → stop, assemble the utterance, run it.
 static void ptt_task(void *arg)
 {
+    int64_t listen_since = 0;                          // us when the current hold started (0 = not listening)
     for (;;) {
         int ev;
-        if (xQueueReceive(s_ptt_q, &ev, portMAX_DELAY) != pdTRUE) continue;
+        // While a hold is in progress, wake every second to enforce the max-listen watchdog: a hold that
+        // never sees its release — a touch PRESS_LOST, or a stuck/phantom touch that never lifts — must
+        // not wedge the device in "Listening..." forever. When idle, block until the next event.
+        TickType_t wait = s_listening ? pdMS_TO_TICKS(1000) : portMAX_DELAY;
+        if (xQueueReceive(s_ptt_q, &ev, wait) != pdTRUE) {
+            if (s_listening && listen_since &&
+                esp_timer_get_time() - listen_since > (int64_t)PTT_MAX_LISTEN_MS * 1000) {
+                ESP_LOGW(TAG, "PTT watchdog: no release after %d ms — auto-stopping", PTT_MAX_LISTEN_MS);
+                s_listening = false;
+                listen_since = 0;
+                speech_stt_session_stop();             // discard the phantom turn; nothing to send
+                turn_perf(false);
+                chat_ui_status(IDLE_HINT);
+            }
+            continue;
+        }
 
         if (ev == 1 && !s_listening) {                 // PRESS (incl. a barge-in restart)
             s_aborting   = false;                      // P-c: consume the barge-in flags for the new turn
@@ -516,6 +549,7 @@ static void ptt_task(void *arg)
             s_ptt_final[0] = '\0';
             s_ptt_run[0]   = '\0';
             s_listening = true;
+            listen_since = esp_timer_get_time();       // arm the watchdog for this hold
             lp_wake();                                 // woke from battery-idle? bring WiFi + codec back…
             if (!net_is_connected()) {                 // …and wait for the link before streaming to Soniox
                 chat_ui_status("Connecting...");
@@ -523,22 +557,49 @@ static void ptt_task(void *arg)
             }
             if (!net_is_connected()) {                 // gave up → don't open a doomed session
                 s_listening = false;
+                listen_since = 0;
                 chat_ui_status("No WiFi");
                 ESP_LOGW(TAG, "wake: WiFi did not reconnect");
                 continue;
             }
             turn_perf(true);                           // low-latency WiFi + 240 MHz CPU for the whole turn
+            // TLS to Deepgram/AG-UI needs a real wall clock (cert validity). Hotspots often block NTP;
+            // sync before opening WSS or the session fails silently / hangs on handshake.
+            if (!net_time_synced()) {
+                chat_ui_status("Syncing clock...");
+                net_time_http_fallback();
+                for (int i = 0; i < 40 && !net_time_synced(); i++)  // ~2s more for late SNTP
+                    vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            if (!net_time_synced()) {
+                s_listening = false;
+                listen_since = 0;
+                turn_perf(false);
+                chat_ui_status("No clock — enable phone data");
+                ESP_LOGW(TAG, "PTT aborted: wall clock not synced (TLS will fail)");
+                continue;
+            }
             chat_ui_status("Listening...");
             play_ptt_beep();                           // "go ahead" cue; plays & returns before capture starts
             speech_stt_cfg_t scfg = { 0 };               // api_key from NVS via speech_cfg
-            if (speech_stt_session_start(&scfg, on_partial, on_turn, NULL) != ESP_OK) {
+            esp_err_t stt_err = speech_stt_session_start(&scfg, on_partial, on_turn, NULL);
+            if (stt_err != ESP_OK) {
                 s_listening = false;
+                listen_since = 0;
                 turn_perf(false);                      // no turn will run; restore power-save now
-                chat_ui_status("STT error");
-                ESP_LOGE(TAG, "STT failed to start");
+                const char *why = speech_stt_last_error();
+                if (stt_err == ESP_ERR_NOT_FOUND)
+                    chat_ui_status("No STT key — open setup");
+                else if (why && why[0])
+                    chat_ui_status(why);
+                else
+                    chat_ui_status("STT error");
+                ESP_LOGE(TAG, "STT failed to start (%s): %s",
+                         esp_err_to_name(stt_err), why ? why : "(no detail)");
             }
         } else if (ev == 0 && s_listening) {           // RELEASE
             s_listening = false;
+            listen_since = 0;
             speech_stt_session_stop();                     // ws task is gone after this; buffers are stable
             if (speech_stt_last_error()) {                 // STT upload/transport died (e.g. hotspot congestion)
                 ESP_LOGW(TAG, "STT failed: %s", speech_stt_last_error());
@@ -621,7 +682,7 @@ static esp_err_t ptt_button_init(void)
     // BOOT: a quick TAP = volume up; a HOLD (>= long_press_time) = push-to-talk (fallback to the
     // touchscreen invoke); a DOUBLE-tap = setup portal. SINGLE_CLICK waits out the double-click window,
     // so a double-tap fires the portal only (no stray volume bump).
-    button_config_t bcfg = { .long_press_time = 300 };
+    button_config_t bcfg = { .long_press_time = 450 };  // ms — avoid accidental PTT on volume taps
     button_gpio_config_t gcfg = { .gpio_num = PTT_GPIO, .active_level = 0 };   // BOOT pulls GPIO0 low
     button_handle_t btn;
     esp_err_t err = iot_button_new_gpio_device(&bcfg, &gcfg, &btn);
@@ -661,6 +722,7 @@ static bool alarm_dismiss_tap(bool *armed)
 static void run_timer_alarm(const char *label)
 {
     chat_ui_note_activity();
+    s_alarm_ringing = true;                  // keep lp_idle from closing the speaker between beeps
     chat_ui_alarm_set(true);                 // black overlay + red ring; suspends the idle saver
 
     int64_t start = esp_timer_get_time();
@@ -686,6 +748,7 @@ static void run_timer_alarm(const char *label)
         cycle++;
     }
     chat_ui_alarm_set(false);                // remove overlay; resume saver; screen on
+    s_alarm_ringing = false;
     bsp_display_brightness_set(ALARM_BRIGHT);
     char msg[72];
     snprintf(msg, sizeof msg, "Timer done%s%s", label[0] ? ": " : "", label);
@@ -712,6 +775,7 @@ void app_main(void)
 
     device_tools_init();
     chat_ui_init();
+    device_tools_set_show_image_handler(chat_ui_show_image);
     agui_client_init();
 
     // Provision until we have WiFi + Soniox key + AG-UI URL.
@@ -730,7 +794,10 @@ void app_main(void)
     net_start_auto_reconnect();
     apply_timezone();                  // P5: load POSIX TZ (default UTC0) for local_time
     net_sntp_start();                  // P5: sync wall-clock time for ambient context (local_time)
-    ESP_LOGI(TAG, "network + keys ready");
+    // Kick HTTP time fallback immediately (don't wait for first heartbeat) — phone hotspots often
+    // block NTP, and TLS to Deepgram/AG-UI needs a real clock before the first PTT.
+    if (!net_time_synced()) net_time_http_fallback();
+    ESP_LOGI(TAG, "network + keys ready (clock %s)", net_time_synced() ? "ok" : "pending");
 
     // Bring the mic up now; the Soniox WSS opens only on a PTT press.
     if (speech_stt_init() != ESP_OK) ESP_LOGE(TAG, "mic init failed");

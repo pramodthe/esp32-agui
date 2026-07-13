@@ -333,6 +333,7 @@ esp_err_t soniox_session_start(const soniox_cfg_t *cfg,
         strlcpy(s_api_key, cfg->api_key, sizeof(s_api_key));
     } else if (!app_cfg_get(APP_CFG_SONIOX_KEY, s_api_key, sizeof(s_api_key))) {
         ESP_LOGE(TAG, "no usable Soniox API key (missing or too long) — re-enter via the portal");
+        strlcpy(s_last_error, "no Soniox API key", sizeof s_last_error);
         xSemaphoreGive(s_lock);
         return ESP_ERR_NOT_FOUND;
     }

@@ -6,6 +6,7 @@
 #include "net_prov_internal.h"
 
 #include <string.h>
+#include <stdlib.h>
 #include <time.h>
 #include <sys/time.h>
 #include "freertos/FreeRTOS.h"
@@ -266,29 +267,89 @@ static void on_sntp_sync(struct timeval *tv)
 
 void net_sntp_start(void)
 {
-    // One-shot SNTP for wall-clock time (P5 ambient context "local_time"). Call once after WiFi is
-    // up; it syncs in the background. Guarded so a later reconnect doesn't re-init the service.
+    // Prefer Google NTP — phone hotspots often block pool.ntp.org. Keep to 1 server
+    // (CONFIG_SNTP_MAX_SERVERS defaults to 1).
     static bool started;
     if (started) return;
-    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    cfg.sync_cb = on_sntp_sync;   // log + flag when the clock is actually set
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("time.google.com");
+    cfg.sync_cb = on_sntp_sync;
     esp_err_t e = esp_netif_sntp_init(&cfg);
-    if (e == ESP_OK) { started = true; ESP_LOGI(TAG, "SNTP started (pool.ntp.org)"); }
+    if (e == ESP_OK) { started = true; ESP_LOGI(TAG, "SNTP started (time.google.com)"); }
     else ESP_LOGW(TAG, "SNTP init failed: %s", esp_err_to_name(e));
 }
 
 bool net_time_synced(void) { return s_time_synced; }
 
-esp_err_t net_time_http_fallback(void)
+static bool apply_unix_time(time_t t, const char *via)
 {
-    // Time-via-HTTPS for networks that block NTP (UDP/123) — common on hotspots/guest WiFi. HEAD a
-    // tiny TLS endpoint, parse the server's Date: header (RFC 1123, UTC) -> settimeofday. Cheap; the
-    // heartbeat retries it until the clock is set, then stops.
-    if (s_time_synced) return ESP_OK;
+    if (t < 1700000000) return false;
+    struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    s_time_synced = true;
+    ESP_LOGI(TAG, "time set via %s: %lld", via, (long long)t);
+    return true;
+}
+
+static bool apply_build_time(void)
+{
+    // Last resort when NTP/HTTP are blocked (common on phone hotspots). Firmware build stamp is
+    // close enough for TLS cert validity windows (years), which unblocks Deepgram/AG-UI.
+    // __DATE__ = "Mmm dd yyyy", __TIME__ = "hh:mm:ss"
+    const char *d = __DATE__;
+    const char *t = __TIME__;
+    const char *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    char mon[4] = { d[0], d[1], d[2], 0 };
+    const char *mp = strstr(months, mon);
+    if (!mp) return false;
+    struct tm tm = {0};
+    tm.tm_year = atoi(d + 7) - 1900;
+    tm.tm_mon  = (int)(mp - months) / 3;
+    tm.tm_mday = atoi(d + 4);
+    tm.tm_hour = atoi(t);
+    tm.tm_min  = atoi(t + 3);
+    tm.tm_sec  = atoi(t + 6);
+    if (!apply_unix_time(tm_to_utc(&tm), "firmware-build")) return false;
+    ESP_LOGW(TAG, "NTP/HTTP blocked — using build time so TLS can proceed");
+    return true;
+}
+
+static esp_err_t time_from_http_body(const char *url)
+{
     esp_http_client_config_t hcfg = {
-        .url               = "https://www.google.com/generate_204",
+        .url        = url,
+        .method     = HTTP_METHOD_GET,
+        .timeout_ms = 5000,
+        .disable_auto_redirect = true,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&hcfg);
+    if (!c) return ESP_FAIL;
+    char body[512];
+    int got = 0;
+    esp_err_t ret = ESP_FAIL;
+    if (esp_http_client_open(c, 0) == ESP_OK) {
+        (void)esp_http_client_fetch_headers(c);
+        int n;
+        while (got < (int)sizeof(body) - 1 &&
+               (n = esp_http_client_read(c, body + got, (int)sizeof(body) - 1 - got)) > 0)
+            got += n;
+        body[got] = '\0';
+        esp_http_client_close(c);
+        const char *p = strstr(body, "\"unixtime\"");
+        if (p) {
+            p = strchr(p, ':');
+            if (p && apply_unix_time((time_t)strtoll(p + 1, NULL, 10), url)) ret = ESP_OK;
+        }
+    }
+    esp_http_client_cleanup(c);
+    return ret;
+}
+
+static esp_err_t time_from_https_date(const char *url)
+{
+    esp_http_client_config_t hcfg = {
+        .url               = url,
         .method            = HTTP_METHOD_HEAD,
-        .timeout_ms        = 8000,
+        .timeout_ms        = 5000,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t c = esp_http_client_init(&hcfg);
@@ -297,19 +358,21 @@ esp_err_t net_time_http_fallback(void)
     if (esp_http_client_perform(c) == ESP_OK) {
         char *date = NULL;
         if (esp_http_client_get_header(c, "Date", &date) == ESP_OK && date) {
-            struct tm tm = {0};   // e.g. "Wed, 23 Jun 2026 18:00:00 GMT"
+            struct tm tm = {0};
             if (strptime(date, "%a, %d %b %Y %H:%M:%S", &tm)) {
-                time_t t = tm_to_utc(&tm);
-                if (t > 1700000000) {
-                    struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
-                    settimeofday(&tv, NULL);
-                    s_time_synced = true;
-                    ESP_LOGI(TAG, "time set via HTTPS Date: %s", date);
-                    ret = ESP_OK;
-                }
+                if (apply_unix_time(tm_to_utc(&tm), date)) ret = ESP_OK;
             }
         }
     }
     esp_http_client_cleanup(c);
     return ret;
+}
+
+esp_err_t net_time_http_fallback(void)
+{
+    if (s_time_synced) return ESP_OK;
+    // Instant provisional clock FIRST so PTT/TLS never wait on a blocked hotspot.
+    // SNTP (time.google.com) may refine later via on_sntp_sync.
+    if (!apply_build_time()) return ESP_FAIL;
+    return ESP_OK;
 }

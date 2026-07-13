@@ -30,6 +30,10 @@ bool device_power_key_short_press(void);
 // True if running on battery (no USB/VBUS power). Gates idle WiFi-off (plugged-in stays connected).
 bool device_tools_on_battery(void);
 
+// Battery gauge for UI (clock page). Returns false if PMIC/gauge unavailable.
+// percent_out: 0..100; plugged_out: USB present; status: short human string (optional).
+bool device_tools_battery_read(int *percent_out, bool *plugged_out, char *status, size_t status_len);
+
 // A tool implementation: parse args, produce a result JSON (caller owns *result).
 typedef esp_err_t (*device_tool_fn)(const cJSON *args, cJSON **result);
 
@@ -48,6 +52,11 @@ bool device_tools_timer_take_fired(char *label, size_t n); // true ONCE after a 
 // Queue signaled (1 item) when a set_timer elapses — block on it instead of polling so the CPU can
 // light-sleep until the deadline. Drain with device_tools_timer_take_fired().
 QueueHandle_t device_tools_timer_queue(void);
+
+// show_image: device_tools owns the AG-UI tool registration; chat_ui owns download/display.
+// Main wires the handler after chat_ui_init() so we avoid a circular component dependency.
+typedef esp_err_t (*device_show_image_fn)(const char *url);
+void device_tools_set_show_image_handler(device_show_image_fn fn);
 
 #ifdef __cplusplus
 }

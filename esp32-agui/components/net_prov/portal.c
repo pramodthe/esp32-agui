@@ -180,7 +180,7 @@ static esp_err_t root_get(httpd_req_t *req)
                 sizeof saved_voice);
 
     // Pre-select speech provider in the form (patch via tiny script after options).
-    char opts[3500];
+    char opts[4200];
     size_t o = 0;
     // Emit both voice lists as JS arrays + initial options for current provider.
     o += snprintf(opts + o, sizeof(opts) - o, "<script>window.__dg=[");
@@ -213,6 +213,7 @@ static esp_err_t root_get(httpd_req_t *req)
                   "<input type=checkbox name=idle_anim value=1%s style='width:auto;display:inline;margin:0'>"
                   " Idle animation (gently pulse the uploaded alarm image when idle)</label>",
                   ia_on ? " checked" : "");
+
     httpd_resp_send_chunk(req, opts, o);
 
     httpd_resp_send_chunk(req, FORM_TAIL_INTRO, HTTPD_RESP_USE_STRLEN);
@@ -267,7 +268,8 @@ static esp_err_t save_post(httpd_req_t *req)
     bool have_scr    = form_field(body, "scr_to", scr_to, sizeof(scr_to)) && scr_to[0];
     ESP_LOGI(TAG, "save: body=%dB ssid=%d key=%d prov=%d url=%d token=%d tz=%d voice=%d scr=%d",
              got, have_ssid, have_key, have_prov, have_url, have_token, have_tz, have_voice, have_scr);
-    if (!have_ssid && !have_key && !have_prov && !have_url && !have_token && !have_tz && !have_voice && !have_scr) {
+    if (!have_ssid && !have_key && !have_prov && !have_url && !have_token && !have_tz && !have_voice &&
+        !have_scr) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "nothing to save");
         return ESP_FAIL;
     }
@@ -335,7 +337,7 @@ static esp_err_t save_post(httpd_req_t *req)
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    static char resp[1024];
+    static char resp[1280];
     snprintf(resp, sizeof resp,
         "<html><head><meta name=viewport content='width=device-width,initial-scale=1'></head>"
         "<body style='font-family:sans-serif;margin:2em'><h3>Saved</h3>"

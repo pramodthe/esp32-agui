@@ -20,7 +20,8 @@ static const char *TAG = "dg_tts";
 
 #define TTS_VOICE_DEFAULT "aura-2-asteria-en"
 #define TTS_SR            16000
-#define WS_BUFFER_BYTES   8192
+#define WS_BUFFER_BYTES   4096
+#define WS_TASK_STACK     5120
 #define MSG_MAX           65536
 #define RING_BYTES        (128 * 1024)
 #define DRAIN_CHUNK       640
@@ -234,16 +235,35 @@ esp_err_t deepgram_tts_open(void)
         .uri = s_uri,
         .headers = s_auth_hdr,
         .buffer_size = WS_BUFFER_BYTES,
-        .task_stack = 8192,
+        .task_stack = WS_TASK_STACK,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .reconnect_timeout_ms = 5000,
+        .disable_auto_reconnect = true,
         .network_timeout_ms = 10000,
         .ping_interval_sec = 20,
     };
     s_ws = esp_websocket_client_init(&wcfg);
     if (!s_ws) { xSemaphoreGive(s_lock); return ESP_FAIL; }
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event, NULL);
-    if (esp_websocket_client_start(s_ws) != ESP_OK) { ws_teardown(); xSemaphoreGive(s_lock); return ESP_FAIL; }
+    if (esp_websocket_client_start(s_ws) != ESP_OK) {
+        ESP_LOGW(TAG, "ws start fail (int free=%u largest=%u) — retry",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        ws_teardown();
+        xSemaphoreGive(s_lock);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_ws = esp_websocket_client_init(&wcfg);
+        if (!s_ws) {
+            xSemaphoreGive(s_lock);
+            return ESP_FAIL;
+        }
+        esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event, NULL);
+        if (esp_websocket_client_start(s_ws) != ESP_OK) {
+            ws_teardown();
+            xSemaphoreGive(s_lock);
+            return ESP_FAIL;
+        }
+    }
 
     EventBits_t b = xEventGroupWaitBits(s_eg, BIT_CONNECTED | BIT_WSERR | BIT_CANCEL,
                                         pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));

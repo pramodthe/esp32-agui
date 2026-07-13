@@ -69,6 +69,7 @@ CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y
 # so the unused 12/14/16/18 tables aren't compiled into flash. (14 is LVGL's stock default; disable
 # it explicitly since the default font is now 20.)
 CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
 CONFIG_LV_FONT_DEFAULT_MONTSERRAT_20=y
 # CONFIG_LV_FONT_MONTSERRAT_14 is not set
 # LVGL demos disabled — our chat_ui owns the UI (P3+). (Were enabled in the source example.)

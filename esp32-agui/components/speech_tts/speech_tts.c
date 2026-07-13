@@ -57,22 +57,29 @@ esp_err_t speech_tts_open(void)
     return deepgram_tts_open();
 }
 
+// feed/finish/wait_drained operate on the stream opened by speech_tts_open(), so they must dispatch to
+// s_inited_for (the backend open() actually initialized), NOT a live speech_provider_get() — matching
+// speech_tts_cancel() below. A mid-stream provider switch would otherwise split one reply across two
+// backends and leak the first's WSS/lock.
 esp_err_t speech_tts_feed(const char *text)
 {
-    if (speech_provider_get() == SPEECH_PROVIDER_SONIOX) return soniox_tts_feed(text);
-    return deepgram_tts_feed(text);
+    if (s_inited_for == SPEECH_PROVIDER_SONIOX)   return soniox_tts_feed(text);
+    if (s_inited_for == SPEECH_PROVIDER_DEEPGRAM) return deepgram_tts_feed(text);
+    return ESP_ERR_INVALID_STATE;
 }
 
 esp_err_t speech_tts_finish(void)
 {
-    if (speech_provider_get() == SPEECH_PROVIDER_SONIOX) return soniox_tts_finish();
-    return deepgram_tts_finish();
+    if (s_inited_for == SPEECH_PROVIDER_SONIOX)   return soniox_tts_finish();
+    if (s_inited_for == SPEECH_PROVIDER_DEEPGRAM) return deepgram_tts_finish();
+    return ESP_OK;
 }
 
 esp_err_t speech_tts_wait_drained(uint32_t timeout_ms)
 {
-    if (speech_provider_get() == SPEECH_PROVIDER_SONIOX) return soniox_tts_wait_drained(timeout_ms);
-    return deepgram_tts_wait_drained(timeout_ms);
+    if (s_inited_for == SPEECH_PROVIDER_SONIOX)   return soniox_tts_wait_drained(timeout_ms);
+    if (s_inited_for == SPEECH_PROVIDER_DEEPGRAM) return deepgram_tts_wait_drained(timeout_ms);
+    return ESP_OK;
 }
 
 void speech_tts_cancel(void)
