@@ -414,37 +414,6 @@ static bool apply_build_time(void)
     return true;
 }
 
-static esp_err_t time_from_http_body(const char *url)
-{
-    esp_http_client_config_t hcfg = {
-        .url        = url,
-        .method     = HTTP_METHOD_GET,
-        .timeout_ms = 5000,
-        .disable_auto_redirect = true,
-    };
-    esp_http_client_handle_t c = esp_http_client_init(&hcfg);
-    if (!c) return ESP_FAIL;
-    char body[512];
-    int got = 0;
-    esp_err_t ret = ESP_FAIL;
-    if (esp_http_client_open(c, 0) == ESP_OK) {
-        (void)esp_http_client_fetch_headers(c);
-        int n;
-        while (got < (int)sizeof(body) - 1 &&
-               (n = esp_http_client_read(c, body + got, (int)sizeof(body) - 1 - got)) > 0)
-            got += n;
-        body[got] = '\0';
-        esp_http_client_close(c);
-        const char *p = strstr(body, "\"unixtime\"");
-        if (p) {
-            p = strchr(p, ':');
-            if (p && apply_unix_time((time_t)strtoll(p + 1, NULL, 10), url)) ret = ESP_OK;
-        }
-    }
-    esp_http_client_cleanup(c);
-    return ret;
-}
-
 static esp_err_t time_from_https_date(const char *url)
 {
     esp_http_client_config_t hcfg = {
@@ -472,8 +441,11 @@ static esp_err_t time_from_https_date(const char *url)
 esp_err_t net_time_http_fallback(void)
 {
     if (s_time_synced) return ESP_OK;
-    // Instant provisional clock FIRST so PTT/TLS never wait on a blocked hotspot.
-    // SNTP (time.google.com) may refine later via on_sntp_sync.
-    if (!apply_build_time()) return ESP_FAIL;
-    return ESP_OK;
+    // Prefer the exact wall clock from an HTTPS Date header — this works on hotspots that block NTP's
+    // UDP/123 (the common failure this fallback exists for) as long as the clock is close enough to
+    // pass TLS cert validity (the board's PCF85063 RTC / a prior sync usually keeps it there). If TLS
+    // can't complete (cold clock, or HTTPS blocked too), stamp the firmware build time: rough but
+    // inside cert windows, so TLS/AG-UI can still proceed and SNTP (time.google.com) can refine later.
+    if (time_from_https_date("https://www.google.com/generate_204") == ESP_OK) return ESP_OK;
+    return apply_build_time() ? ESP_OK : ESP_FAIL;
 }

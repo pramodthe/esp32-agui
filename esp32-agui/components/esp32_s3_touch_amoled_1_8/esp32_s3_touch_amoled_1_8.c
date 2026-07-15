@@ -468,24 +468,34 @@ esp_err_t bsp_display_brightness_set(int brightness_percent)
     // mutex — a silent, permanent UI wedge (every later locker just logs "Failed to acquire LVGL
     // lock"; heartbeats keep running). Serialize: hold the (recursive) display lock so the LVGL
     // task can't start a new flush, then drain any in-flight band DMA — the default flush path is
-    // asynchronous, so the lock alone doesn't cover a tail transfer. Before the adapter exists the
-    // lock fails cleanly (ESP_ERR_INVALID_STATE) and nothing else is flushing, so send unlocked.
+    // asynchronous, so the lock alone doesn't cover a tail transfer.
+    //
+    // If a race-free tx_param can't be guaranteed — the lock is held by an active LVGL flush, or a
+    // flush is STILL in flight after the bounded drain — return ESP_ERR_TIMEOUT WITHOUT touching the
+    // IO, so the caller can retry on its next tick (the screen-power task polls on a cadence, so this
+    // is a deferral, not a spin). Before the LVGL adapter exists the lock fails but nothing is
+    // flushing, so it's safe to send unlocked.
     // Do not call from the LVGL task while a flush it issued is pending.
     bool locked = bsp_display_lock(1000);
-    if (locked) {
 #if LVGL_VERSION_MAJOR < 9
-        lv_disp_t *disp = lv_disp_get_default();
+    lv_disp_t *disp = lv_disp_get_default();
+    if (locked) {
         if (disp && disp->driver && disp->driver->draw_buf) {
             // Let any in-flight color flush finish before we tx_param on the shared QSPI IO.
-            // Bounded wait, then proceed under the lock (never bail with the lock held or return
-            // a status the caller will retry-storm on — that starves the LVGL task and wedges it).
             for (int i = 0; disp->driver->draw_buf->flushing && i < 200; ++i) {
                 vTaskDelay(pdMS_TO_TICKS(1));
             }
+            if (disp->driver->draw_buf->flushing) {   // never drained → don't race it, defer
+                bsp_display_unlock();
+                return ESP_ERR_TIMEOUT;
+            }
             vTaskDelay(pdMS_TO_TICKS(2));   // small settle for the async DMA tail before tx_param
         }
-#endif
+    } else if (disp != NULL) {
+        // Adapter is up but the lock timed out → an LVGL flush holds it; sending unlocked would race.
+        return ESP_ERR_TIMEOUT;
     }
+#endif
     esp_lcd_panel_io_tx_param(io_handle, lcd_cmd, &param, 1);
     if (locked) {
         bsp_display_unlock();
