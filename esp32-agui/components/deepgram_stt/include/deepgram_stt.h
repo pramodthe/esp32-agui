@@ -13,7 +13,7 @@ extern "C" {
 typedef struct {
     const char *endpoint;    // NULL -> wss://api.deepgram.com/v1/listen?...
     const char *api_key;     // required (facade supplies from NVS)
-    const char *model;       // NULL -> "nova-3"
+    const char *model;       // NULL -> "nova-2"
     int         sample_rate; // 0 -> 16000
 } deepgram_stt_cfg_t;
 

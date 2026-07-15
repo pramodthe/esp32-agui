@@ -55,6 +55,8 @@ void net_wifi_resume(void);
 // NVS credential list management.
 esp_err_t net_creds_add(const char *ssid, const char *pass);
 esp_err_t net_creds_clear(void);
+// Drop saved SSIDs whose name starts with prefix (case-insensitive). Returns how many were removed.
+int net_creds_remove_prefix(const char *prefix);
 
 // Fallback provisioning (P0.5): SoftAP + captive-portal web form + DNS catch-all.
 esp_err_t net_portal_start(const char *ap_ssid);

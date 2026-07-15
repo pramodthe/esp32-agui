@@ -13,6 +13,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "jpeg_decoder.h"
 #include "bsp/esp32_s3_touch_amoled_1_8.h"
 #include "device_tools.h"
@@ -230,7 +231,7 @@ esp_err_t chat_ui_init(void)
     lv_obj_set_style_text_color(s_status, lv_palette_main(LV_PALETTE_GREY), 0);
     lv_obj_set_style_text_font(s_status, CHAT_FONT, 0);
     lv_obj_set_pos(s_status, 0, 7);
-    lv_label_set_text(s_status, "Connecting...");   // not ready until WiFi is up + boot sets IDLE_HINT
+    lv_label_set_text(s_status, "WiFi...");   // not ready until WiFi is up + boot sets IDLE_HINT
 
     s_chat = lv_obj_create(scr);
     lv_obj_remove_style_all(s_chat);
@@ -671,18 +672,44 @@ static void screen_power_task(void *arg)
             if (want_on) {                          // → on (woke from blank or screensaver)
                 idle_anim_stop();                   // remove the screensaver if it was showing
                 s_screen_on = true;
-                bsp_display_brightness_set(SCREEN_ON_BRIGHTNESS);
+                // Resume face animation before lighting the panel (timer pause needs LVGL lock).
+                if (bsp_display_lock(500)) {
+                    face_engine_set_active(face_engine_is_visible());
+                    bsp_display_unlock();
+                }
+                if (bsp_display_brightness_set(SCREEN_ON_BRIGHTNESS) != ESP_OK) {
+                    // Flush was busy — try again next poll; keep want_on intent.
+                    s_screen_on = false;
+                    continue;
+                }
                 ESP_LOGI(TAG, "screen on (idle=%ums)", (unsigned)idle);
                 if (s_power_cb) s_power_cb(true);   // back to active power state
             } else if (s_idle_anim_enabled && idle_anim_start()) {
                 // Idle + screensaver enabled + image present: pulse the image instead of blanking. Keep
                 // the panel lit + the system awake (the animation needs the CPU) → no power_cb(false).
+                if (bsp_display_lock(500)) {
+                    face_engine_set_active(false);  // stop canvas flushes during screensaver
+                    bsp_display_unlock();
+                }
                 s_screen_on = false;
                 bsp_display_brightness_set(SCREEN_ON_BRIGHTNESS);
                 ESP_LOGI(TAG, "screen idle → screensaver (idle=%ums)", (unsigned)idle);
             } else {                                // → off (blank)
+                // Pause face BEFORE brightness / light-sleep: a pending QSPI flush + sleep or a
+                // brightness tx_param race permanently wedges LVGL (ui=STALLED).
+                if (bsp_display_lock(500)) {
+                    face_engine_set_active(false);
+                    bsp_display_unlock();
+                }
+                if (bsp_display_brightness_set(0) != ESP_OK) {
+                    // Still flushing — leave "want off" for the next poll; don't release PM yet.
+                    if (bsp_display_lock(200)) {
+                        face_engine_set_active(face_engine_is_visible());
+                        bsp_display_unlock();
+                    }
+                    continue;
+                }
                 s_screen_on = false;
-                bsp_display_brightness_set(0);
                 ESP_LOGI(TAG, "screen off (idle=%ums%s)", (unsigned)idle,
                          s_force_off_armed ? ", PWR-off" : "");
                 if (s_power_cb) s_power_cb(false);  // gate light sleep on display state
@@ -756,6 +783,7 @@ static esp_err_t http_get_psram(const char *url, uint8_t **out, int *out_len)
         .timeout_ms = 20000,
         .buffer_size = 4096,
         .buffer_size_tx = 1024,
+        .crt_bundle_attach = esp_crt_bundle_attach,  // required for HTTPS media (Fly)
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) { heap_caps_free(buf); return ESP_FAIL; }
@@ -818,7 +846,12 @@ static esp_err_t jpeg_to_rgb565(const uint8_t *jpg, int jpg_len,
         if (info.width / scales[i].div > IMG_DISP_MAX_W || info.height / scales[i].div > IMG_DISP_MAX_H)
             continue;   // decoded size still too big at this scale → try the next smaller scale
 
-        size_t need = info.output_len ? info.output_len : (size_t)info.width * info.height * 2;
+        uint16_t dw = (uint16_t)(info.width / scales[i].div);
+        uint16_t dh = (uint16_t)(info.height / scales[i].div);
+        // Prefer a buffer sized for the scaled output. Some esp_jpeg builds report full-frame
+        // output_len even when out_scale shrinks pixels — don't trust it blindly.
+        size_t need = (size_t)dw * (size_t)dh * 2;
+        if (info.output_len > need) need = info.output_len;
         uint8_t *out = heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!out) continue;
 

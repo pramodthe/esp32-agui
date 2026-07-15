@@ -476,9 +476,13 @@ esp_err_t bsp_display_brightness_set(int brightness_percent)
 #if LVGL_VERSION_MAJOR < 9
         lv_disp_t *disp = lv_disp_get_default();
         if (disp && disp->driver && disp->driver->draw_buf) {
-            for (int i = 0; disp->driver->draw_buf->flushing && i < 100; ++i) {
+            // Let any in-flight color flush finish before we tx_param on the shared QSPI IO.
+            // Bounded wait, then proceed under the lock (never bail with the lock held or return
+            // a status the caller will retry-storm on — that starves the LVGL task and wedges it).
+            for (int i = 0; disp->driver->draw_buf->flushing && i < 200; ++i) {
                 vTaskDelay(pdMS_TO_TICKS(1));
             }
+            vTaskDelay(pdMS_TO_TICKS(2));   // small settle for the async DMA tail before tx_param
         }
 #endif
     }

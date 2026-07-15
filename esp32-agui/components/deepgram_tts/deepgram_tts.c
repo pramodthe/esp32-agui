@@ -20,8 +20,8 @@ static const char *TAG = "dg_tts";
 
 #define TTS_VOICE_DEFAULT "aura-2-orion-en"   // male Aura-2; override via portal NVS
 #define TTS_SR            16000
-#define WS_BUFFER_BYTES   4096
-#define WS_TASK_STACK     5120
+#define WS_BUFFER_BYTES   2048
+#define WS_TASK_STACK     4096
 #define MSG_MAX           65536
 #define RING_BYTES        (128 * 1024)
 #define DRAIN_CHUNK       640

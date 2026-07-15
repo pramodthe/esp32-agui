@@ -39,6 +39,7 @@ static time_t tm_to_utc(const struct tm *tm)
 
 #define NVS_NS         "netprov"
 #define KEY_COUNT      "count"
+#define KEY_LAST_SSID  "last_ssid"   // prefer this network on next boot (skips dead hotspots)
 #define BACKOFF_MIN_MS 1000
 #define BACKOFF_MAX_MS 30000
 
@@ -109,6 +110,65 @@ esp_err_t net_creds_clear(void)
     return err;
 }
 
+static bool ssid_has_prefix_ci(const char *ssid, const char *prefix)
+{
+    if (!ssid || !prefix || !prefix[0]) return false;
+    for (; *prefix; ssid++, prefix++) {
+        char a = *ssid, b = *prefix;
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (!a || a != b) return false;
+    }
+    return true;
+}
+
+int net_creds_remove_prefix(const char *prefix)
+{
+    net_cred_t creds[NET_PROV_MAX_CREDS];
+    int n = net_creds_load(creds, NET_PROV_MAX_CREDS);
+    if (n <= 0) return 0;
+
+    net_cred_t keep[NET_PROV_MAX_CREDS];
+    int nk = 0, dropped = 0;
+    for (int i = 0; i < n; i++) {
+        if (ssid_has_prefix_ci(creds[i].ssid, prefix)) {
+            ESP_LOGI(TAG, "removing saved ssid=%s", creds[i].ssid);
+            dropped++;
+            continue;
+        }
+        keep[nk++] = creds[i];
+    }
+    if (dropped == 0) return 0;
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return 0;
+    // Rewrite compact slots 0..nk-1; clear leftover slots so count stays honest.
+    for (int i = 0; i < NET_PROV_MAX_CREDS; i++) {
+        char ks[16], kp[16];
+        snprintf(ks, sizeof(ks), "ssid%d", i);
+        snprintf(kp, sizeof(kp), "pass%d", i);
+        nvs_erase_key(h, ks);
+        nvs_erase_key(h, kp);
+    }
+    for (int i = 0; i < nk; i++) {
+        char ks[16], kp[16];
+        snprintf(ks, sizeof(ks), "ssid%d", i);
+        snprintf(kp, sizeof(kp), "pass%d", i);
+        nvs_set_str(h, ks, keep[i].ssid);
+        nvs_set_str(h, kp, keep[i].pass);
+    }
+    nvs_set_u8(h, KEY_COUNT, (uint8_t)nk);
+    // Drop last_ssid if it was a pruned network.
+    char last[33] = { 0 };
+    size_t ls = sizeof(last);
+    if (nvs_get_str(h, KEY_LAST_SSID, last, &ls) == ESP_OK && ssid_has_prefix_ci(last, prefix))
+        nvs_erase_key(h, KEY_LAST_SSID);
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "pruned %d cred(s); %d remain", dropped, nk);
+    return dropped;
+}
+
 // ---- event handlers ------------------------------------------------------
 
 static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -177,6 +237,43 @@ esp_err_t net_prov_init(void)
     return ESP_OK;
 }
 
+static void net_remember_ssid(const char *ssid)
+{
+    if (!ssid || !ssid[0]) return;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, KEY_LAST_SSID, ssid);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// Build try-order: last successful SSID first, then newest→oldest (portal appends at end).
+static int net_creds_order(net_cred_t *creds, int n, int *order)
+{
+    char last[33] = { 0 };
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t ls = sizeof(last);
+        nvs_get_str(h, KEY_LAST_SSID, last, &ls);
+        nvs_close(h);
+    }
+    int k = 0;
+    bool used[NET_PROV_MAX_CREDS] = { 0 };
+    if (last[0]) {
+        for (int i = 0; i < n; i++) {
+            if (strcmp(creds[i].ssid, last) == 0) {
+                order[k++] = i;
+                used[i] = true;
+                break;
+            }
+        }
+    }
+    for (int i = n - 1; i >= 0; i--) {   // newest first among the rest
+        if (!used[i]) order[k++] = i;
+    }
+    return k;
+}
+
 esp_err_t net_connect_saved(uint32_t per_net_timeout_ms)
 {
     net_cred_t creds[NET_PROV_MAX_CREDS];
@@ -185,14 +282,17 @@ esp_err_t net_connect_saved(uint32_t per_net_timeout_ms)
         ESP_LOGW(TAG, "no saved credentials");
         return ESP_ERR_NOT_FOUND;
     }
+    int order[NET_PROV_MAX_CREDS];
+    int ntry = net_creds_order(creds, n, order);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    for (int i = 0; i < n; i++) {
+    for (int t = 0; t < ntry; t++) {
+        int i = order[t];
         wifi_config_t wc = { 0 };
         strlcpy((char *)wc.sta.ssid, creds[i].ssid, sizeof(wc.sta.ssid));
         strlcpy((char *)wc.sta.password, creds[i].pass, sizeof(wc.sta.password));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
 
-        ESP_LOGI(TAG, "trying [%d/%d] ssid=%s", i + 1, n, creds[i].ssid);
+        ESP_LOGI(TAG, "trying [%d/%d] ssid=%s", t + 1, ntry, creds[i].ssid);
         xEventGroupClearBits(s_eg, BIT_CONNECTED | BIT_FAIL);
         s_connecting = true;
         esp_wifi_connect();
@@ -202,6 +302,7 @@ esp_err_t net_connect_saved(uint32_t per_net_timeout_ms)
         s_connecting = false;
         if (bits & BIT_CONNECTED) {
             ESP_LOGI(TAG, "connected to %s", creds[i].ssid);
+            net_remember_ssid(creds[i].ssid);
             return ESP_OK;
         }
         esp_wifi_disconnect();   // early-abort → next network

@@ -8,7 +8,7 @@ app (`main`, push-to-talk, AG-UI) stays provider-agnostic.
 | Provider | STT | TTS | Default |
 |----------|-----|-----|---------|
 | **Soniox** | Real-time WSS (`stt-rt-v5`) | Real-time WSS (`tts-rt-v1`) | Yes (fresh flash + legacy) |
-| **Deepgram** | Listen v1 WSS (`nova-3`, linear16 @ 16 kHz) | Speak v1 WSS (Aura-2, linear16 @ 16 kHz) | Opt-in via portal |
+| **Deepgram** | Listen v1 WSS (`nova-2`, linear16 @ 16 kHz) | Speak v1 WSS (Aura-2, linear16 @ 16 kHz) | Opt-in via portal |
 
 Select the provider and paste that vendor’s API key in the **AMOLED-setup** captive portal.
 Switching providers requires a new API key; the portal resets TTS voice to the new provider’s default.

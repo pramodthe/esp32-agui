@@ -113,7 +113,7 @@ static volatile bool s_aborting;
 #define PEND_MAX            4      // max client tool calls captured per run
 #define TOOL_ID_MAX        64
 #define TOOL_NAME_MAX      48
-#define TOOL_ARGS_MAX     512
+#define TOOL_ARGS_MAX    1024   // show_image URLs can be long Fly/CDN paths
 
 typedef struct {
     char id[TOOL_ID_MAX];
@@ -552,7 +552,7 @@ static void ptt_task(void *arg)
             listen_since = esp_timer_get_time();       // arm the watchdog for this hold
             lp_wake();                                 // woke from battery-idle? bring WiFi + codec back…
             if (!net_is_connected()) {                 // …and wait for the link before streaming to Soniox
-                chat_ui_status("Connecting...");
+                chat_ui_status("WiFi...");
                 for (int i = 0; i < 100 && !net_is_connected(); i++) vTaskDelay(pdMS_TO_TICKS(50)); // ~5s
             }
             if (!net_is_connected()) {                 // gave up → don't open a doomed session
@@ -781,7 +781,15 @@ void app_main(void)
     // Provision until we have WiFi + Soniox key + AG-UI URL.
     ESP_ERROR_CHECK(net_prov_init());
     for (;;) {
-        bool wifi_ok = net_is_connected() || (net_connect_saved(15000) == ESP_OK);
+        // Guest/AP can flake once after a reset; retry before opening the SoftAP setup portal.
+        bool wifi_ok = net_is_connected();
+        if (!wifi_ok) {
+            chat_ui_status("WiFi...");
+            for (int attempt = 0; attempt < 3 && !wifi_ok; attempt++) {
+                if (attempt) vTaskDelay(pdMS_TO_TICKS(1500));
+                wifi_ok = (net_connect_saved(12000) == ESP_OK);
+            }
+        }
         bool key_ok  = speech_cfg_has_key();
         bool url_ok  = app_cfg_has(APP_CFG_AGUI_URL);
         if (wifi_ok && key_ok && url_ok) break;

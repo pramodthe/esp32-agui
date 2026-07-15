@@ -18,17 +18,20 @@
 
 static const char *TAG = "dg_stt";
 
-#define DEFAULT_MODEL    "nova-3"
+#define DEFAULT_MODEL    "nova-2"
 #define DEFAULT_SR       16000
 #define MIC_GAIN_DB      30.0f
 #define READ_CHUNK_BYTES 640
 #define DRAIN_CHUNKS     8
-// Keep WS buffers/stack modest: rx+tx are calloc'd in *internal* RAM, and the ws
-// task stack is too. After AG-UI TLS, an 8 KB stack often fails → "websocket start: ESP_FAIL".
-#define WS_BUFFER_BYTES  4096
-#define WS_TASK_STACK    5120
+// Keep WS buffers modest: rx+tx are calloc'd in *internal* RAM. After AG-UI/TLS the
+// largest internal block is often ~7–8 KB, so 2 KB buffers keep the WSS start reliable.
+// The task stack is different — it runs the mbedTLS handshake, and 4 KB overflows it
+// (stack-overflow panic in websocket_task the instant listening connects). 5 KB worked;
+// keep >= 6 KB for headroom.
+#define WS_BUFFER_BYTES  2048
+#define WS_TASK_STACK    6144
 #define SEND_MAX_BYTES   WS_BUFFER_BYTES
-#define SEND_TRIGGER     2048
+#define SEND_TRIGGER     1024
 #define AUDIO_SB_BYTES   (32 * 1024)
 #define COMMITTED_MAX    512
 #define RUNNING_MAX      640
@@ -341,6 +344,15 @@ esp_err_t deepgram_stt_session_start(const deepgram_stt_cfg_t *cfg,
     xSemaphoreTake(s_cap_done, 0);
     xSemaphoreTake(s_send_done, 0);
     xStreamBufferReset(s_audio_sb);
+
+    ESP_LOGI(TAG, "ws open prep int free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    // Brief settle — AG-UI TLS teardown can leave the heap ragged for a moment.
+    xSemaphoreGive(s_lock);
+    vTaskDelay(pdMS_TO_TICKS(80));
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_active) { xSemaphoreGive(s_lock); return ESP_ERR_INVALID_STATE; }
 
     esp_websocket_client_config_t wcfg = {
         .uri = s_uri,
